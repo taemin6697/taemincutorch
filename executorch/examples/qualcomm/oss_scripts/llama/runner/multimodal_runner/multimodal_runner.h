@@ -44,6 +44,19 @@ enum KvBitWidth {
 template <typename T>
 class MultimodalRunner : public executorch::extension::llm::IRunner {
  public:
+  struct PhaseTiming {
+    long start_ms{0};
+    long end_ms{0};
+    long rss_kb_start{0};
+    long rss_kb_end{0};
+  };
+
+  struct GeneratePhaseTimings {
+    PhaseTiming embedding_and_merging;
+    PhaseTiming prefill;
+    PhaseTiming decode;
+  };
+
   explicit MultimodalRunner(
       std::unique_ptr<executorch::extension::Module> module,
       std::unique_ptr<executorch::extension::Module> embedding_module,
@@ -139,6 +152,10 @@ class MultimodalRunner : public executorch::extension::llm::IRunner {
   /** Modality placeholder token id exposed for the streaming runner. */
   uint64_t get_placeholder_token_id();
 
+  GeneratePhaseTimings get_last_generate_phase_timings() const {
+    return last_generate_phase_timings_;
+  }
+
   /**
    * Return the exact string that prefill_prefix() tokenizes.
    * Used for kv_log to show actual inference input (no manual formatting).
@@ -231,6 +248,7 @@ class MultimodalRunner : public executorch::extension::llm::IRunner {
 
   // stats
   executorch::llm::Stats stats_;
+  GeneratePhaseTimings last_generate_phase_timings_;
 
   std::function<void(const char* phase, long start_ms, long end_ms)> load_phase_cb_;
 };

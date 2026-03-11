@@ -467,6 +467,7 @@ Error Runner<T>::generate_from_prompt_or_file(
       prompt_tokens,
       cur_pos_,
       seq_len,
+      config.ignore_eos,
       token_callback,
       dump_logits,
       attention_sink_rope_runner_.get(),

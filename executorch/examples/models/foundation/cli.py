@@ -51,6 +51,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         decode_after_frames=args.decode_after_frames,
         eval_mode=eval_mode,
         lazy_kv_alloc=args.lazy_kv_alloc,
+        ignore_eos=args.ignore_eos,
         save_log=args.save_log,
         stream=args.stream,
         runner_binary=args.runner_binary,
@@ -165,8 +166,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--lazy_kv_alloc",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="QNN KV cache lazy 물리 할당(mmap, 기본값) 또는 즉시 전체 할당(std::vector).",
+        default=False,
+        help="QNN KV cache lazy 물리 할당(mmap). 기본값은 --no-lazy_kv_alloc.",
+    )
+    run_parser.add_argument(
+        "--ignore_eos",
+        action="store_true",
+        help="EOS/stop token이 나와도 멈추지 않고 seq_len 한도까지 계속 생성.",
     )
     run_parser.add_argument("--stream", action="store_true")
     run_parser.add_argument("--save_log", action="store_true")

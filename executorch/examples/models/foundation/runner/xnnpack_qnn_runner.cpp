@@ -48,12 +48,13 @@ DEFINE_string(system_prompt, "", "System prompt.");
 // Generation
 DEFINE_double(temperature, 0.0f, "Sampling temperature.");
 DEFINE_int32(seq_len, 128, "Max tokens to generate.");
+DEFINE_bool(ignore_eos, false, "Ignore EOS/stop token and continue until seq_len.");
 DEFINE_int32(eval_mode, 1, "0=KV, 1=Hybrid, 2=Lookahead.");
 DEFINE_bool(shared_buffer, false, "Use shared buffers (QNN).");
 DEFINE_bool(
     lazy_kv_alloc,
-    true,
-    "QNN KV cache lazy physical allocation via mmap(true) or eager std::vector(false).");
+    false,
+    "QNN KV cache lazy physical allocation via mmap(true). Default is eager std::vector(false).");
 
 // Lookahead
 DEFINE_int32(ngram, 0, "Lookahead ngram size.");
@@ -221,7 +222,7 @@ void run_qnn_multimodal(
   };
 
   executorch::extension::llm::GenerationConfig config{
-      true, false, -1, false, FLAGS_seq_len,
+      true, FLAGS_ignore_eos, -1, false, FLAGS_seq_len,
       static_cast<float>(FLAGS_temperature), 0, 0};
 
   int32_t img_seq_len = encoder_runner->get_image_seq_len();
@@ -297,6 +298,7 @@ void run_xnnpack_backend(
   config.seq_len = FLAGS_seq_len;
   config.temperature = static_cast<float>(FLAGS_temperature);
   config.lazy_kv_alloc = FLAGS_lazy_kv_alloc;
+  config.ignore_eos = FLAGS_ignore_eos;
   config.output_path = FLAGS_output_path;
 
   auto runner = create_xnnpack_backend_runner(manifest);
@@ -385,6 +387,7 @@ int main(int argc, char** argv) {
       config.temperature = static_cast<float>(FLAGS_temperature);
       config.eval_mode = FLAGS_eval_mode;
       config.lazy_kv_alloc = FLAGS_lazy_kv_alloc;
+      config.ignore_eos = FLAGS_ignore_eos;
       config.output_path = FLAGS_output_path;
 
       auto runner =

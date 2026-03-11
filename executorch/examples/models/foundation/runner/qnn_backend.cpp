@@ -48,6 +48,7 @@ void write_proc_header(std::ofstream& fproc) {
            "L_DecoderLoad: 텍스트 디코더/러너 load  "
            "L_EmbeddingLoad: 텍스트 임베딩 모듈 준비\n";
   fproc << "# V_Encode: col_a=vision_encode_ms (비전 인코더만)\n";
+  fproc << "# EmbeddingAndMerging: image hidden state setup + prompt build + runner prefill entry prep\n";
   fproc << "# T_Prefill: col_a=text_kv_prefill_ms  Decode: col_b=token_gen_ms\n";
   fproc << "# S: 256토큰 구간 경계  D: 토큰별 decode\n";
 }
@@ -241,7 +242,7 @@ executorch::runtime::Error run_batch_qnn(
 
   executorch::extension::llm::GenerationConfig gen_config{
       /*echo=*/true,
-      /*ignore_eos=*/false,
+      /*ignore_eos=*/config.ignore_eos,
       /*max_new_tokens=*/-1,
       /*warming=*/false,
       /*seq_len=*/config.seq_len,
@@ -319,10 +320,26 @@ executorch::runtime::Error run_batch_qnn(
         runner.generate_from_prompt_or_file(
             full_prompt, false, gen_config, cb, stats_cb));
     const long t_q_end = time_in_ms();
-    const double elapsed_prefill_start = (t_q_start - t_run_start) / 1000.0;
-    const double elapsed_prefill_end =
-        elapsed_prefill_start + (text_kv_prefill_ms / 1000.0);
-    const double elapsed_decode_end = (t_q_end - t_run_start) / 1000.0;
+    const auto phase_timings = runner.get_last_generate_phase_timings();
+    const auto& em_timing = phase_timings.embedding_and_merging;
+    const auto& prefill_timing = phase_timings.prefill;
+    const auto& decode_timing = phase_timings.decode;
+    const bool has_internal_prefill =
+        prefill_timing.start_ms > 0 && prefill_timing.end_ms >= prefill_timing.start_ms;
+    const bool has_internal_decode =
+        decode_timing.start_ms > 0 && decode_timing.end_ms >= decode_timing.start_ms;
+    const double elapsed_prefill_start = has_internal_prefill
+        ? (prefill_timing.start_ms - t_run_start) / 1000.0
+        : (t_q_start - t_run_start) / 1000.0;
+    const double elapsed_prefill_end = has_internal_prefill
+        ? (prefill_timing.end_ms - t_run_start) / 1000.0
+        : (elapsed_prefill_start + (text_kv_prefill_ms / 1000.0));
+    const double elapsed_decode_start = has_internal_decode
+        ? (decode_timing.start_ms - t_run_start) / 1000.0
+        : elapsed_prefill_end;
+    const double elapsed_decode_end = has_internal_decode
+        ? (decode_timing.end_ms - t_run_start) / 1000.0
+        : (t_q_end - t_run_start) / 1000.0;
     const long rss_q = rss_kb();
     const long rss_first =
         rss_at_first_token.load() >= 0 ? rss_at_first_token.load() : rss_before_q;
@@ -345,15 +362,34 @@ executorch::runtime::Error run_batch_qnn(
     const double kv_pct_prefill =
         kv_ctx > 0 ? 100.0 * kv_prefill / kv_ctx : 0.0;
     const double kv_after_pct = kv_ctx > 0 ? 100.0 * kv_after / kv_ctx : 0.0;
+    if (em_timing.start_ms > 0 && em_timing.end_ms >= em_timing.start_ms) {
+      fproc << "EmbeddingAndMerging,"
+            << (em_timing.start_ms - t_run_start) / 1000.0 << ","
+            << (em_timing.end_ms - t_run_start) / 1000.0 << ","
+            << em_timing.rss_kb_start << "," << em_timing.rss_kb_end << ","
+            << (em_timing.end_ms - em_timing.start_ms) << ",,"
+            << (em_timing.end_ms - em_timing.start_ms) << ",,,,,\n";
+    }
     fproc << "T_Prefill," << elapsed_prefill_start << ","
           << elapsed_prefill_end << ","
-          << rss_before_q << "," << rss_first << ","
-          << text_kv_prefill_ms << ",," << text_kv_prefill_ms << ","
+          << (has_internal_prefill ? prefill_timing.rss_kb_start : rss_before_q) << ","
+          << (has_internal_prefill ? prefill_timing.rss_kb_end : rss_first) << ","
+          << (has_internal_prefill ? (prefill_timing.end_ms - prefill_timing.start_ms)
+                                   : text_kv_prefill_ms)
+          << ",,"
+          << (has_internal_prefill ? (prefill_timing.end_ms - prefill_timing.start_ms)
+                                   : text_kv_prefill_ms)
+          << ","
           << kv_prefill << "," << kv_ctx << "," << kv_pct_prefill << ","
           << kv_used_kb_prefill << "," << kv_total_kb_q << ",\n";
-    fproc << "Decode," << elapsed_prefill_end << "," << elapsed_decode_end << ","
-          << rss_first << "," << rss_q << ","
-          << "," << q_gen_ms << "," << q_gen_ms << ","
+    fproc << "Decode," << elapsed_decode_start << "," << elapsed_decode_end << ","
+          << (has_internal_decode ? decode_timing.rss_kb_start : rss_first) << ","
+          << (has_internal_decode ? decode_timing.rss_kb_end : rss_q) << ","
+          << ","
+          << (has_internal_decode ? (decode_timing.end_ms - decode_timing.start_ms) : q_gen_ms)
+          << ","
+          << (has_internal_decode ? (decode_timing.end_ms - decode_timing.start_ms) : q_gen_ms)
+          << ","
           << kv_after << "," << kv_ctx << "," << kv_after_pct << ","
           << kv_used_kb_q << "," << kv_total_kb_q << ",\n";
     for (const auto& row : d_rows_buffer) {

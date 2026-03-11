@@ -97,6 +97,7 @@ class LhdTokenGenerator : public TokenGenerator<T> {
       std::vector<uint64_t> tokens,
       int64_t start_pos,
       int32_t seq_len,
+      bool ignore_eos,
       std::function<void(const std::string&)> token_callback,
       bool dump_logits,
       AttentionSinkRopeRunner* attention_sink_rope_runner,

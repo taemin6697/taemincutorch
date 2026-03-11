@@ -505,6 +505,7 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
     stats_.model_load_end_ms = time_in_ms();
   }
   stats_.inference_start_ms = time_in_ms();
+  last_generate_phase_timings_ = {};
 
   int32_t seq_len = config.seq_len;
   if (seq_len > context_len_) {
@@ -527,6 +528,9 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
   int32_t n_bos = 0;
 
   // encode the (string) prompt into tokens sequence
+  last_generate_phase_timings_.embedding_and_merging.start_ms = time_in_ms();
+  last_generate_phase_timings_.embedding_and_merging.rss_kb_start =
+      static_cast<long>(get_rss_bytes() / 1024);
   std::vector<uint64_t> prompt_tokens;
   if (tokenized_prompt) {
     std::ifstream inFile(prompt, std::ios::binary);
@@ -579,10 +583,19 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
   ET_LOG(Info, "Merging text embeddings with image hidden states");
   merge_multimodal_embeddings(
       prompt_tokens, text_embeddings, placeholder_token_id);
+  last_generate_phase_timings_.embedding_and_merging.end_ms = time_in_ms();
+  last_generate_phase_timings_.embedding_and_merging.rss_kb_end =
+      static_cast<long>(get_rss_bytes() / 1024);
 
+  last_generate_phase_timings_.prefill.start_ms = time_in_ms();
+  last_generate_phase_timings_.prefill.rss_kb_start =
+      static_cast<long>(get_rss_bytes() / 1024);
   auto prefill_res = prompt_processor_->prefill(
       merged_embeddings_, cur_pos_, dump_logits, nullptr);
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
+  last_generate_phase_timings_.prefill.end_ms = time_in_ms();
+  last_generate_phase_timings_.prefill.rss_kb_end =
+      static_cast<long>(get_rss_bytes() / 1024);
   uint64_t cur_token = prefill_res.get();
   cur_pos_ += num_prompt_tokens;
   stats_.first_token_ms = time_in_ms();
@@ -642,14 +655,21 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
     }
   }
 
+  last_generate_phase_timings_.decode.start_ms = time_in_ms();
+  last_generate_phase_timings_.decode.rss_kb_start =
+      static_cast<long>(get_rss_bytes() / 1024);
   int64_t num_generated_tokens = ET_UNWRAP(token_generator_->generate(
       prompt_tokens,
       cur_pos_,
       seq_len,
+      config.ignore_eos,
       token_callback,
       dump_logits,
       nullptr,
       config.per_token_timing_cb));
+  last_generate_phase_timings_.decode.end_ms = time_in_ms();
+  last_generate_phase_timings_.decode.rss_kb_end =
+      static_cast<long>(get_rss_bytes() / 1024);
   stats_.inference_end_ms = time_in_ms();
   ET_LOG(
       Info,

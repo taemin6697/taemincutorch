@@ -226,6 +226,7 @@ Result<int64_t> TokenGenerator<T>::generate(
     std::vector<uint64_t> tokens,
     int64_t start_pos,
     int32_t seq_len,
+    bool ignore_eos,
     std::function<void(const std::string&)> token_callback,
     bool dump_logits,
     AttentionSinkRopeRunner* attention_sink_rope_runner,
@@ -349,7 +350,7 @@ Result<int64_t> TokenGenerator<T>::generate(
     }
 
     // data-dependent terminating condition: we have n_eos_ number of EOS
-    if (eos_ids_->count(cur_token) > 0) {
+    if (!ignore_eos && eos_ids_->count(cur_token) > 0) {
       printf("\n");
       ET_LOG(Info, "\nReached to the end of generation");
       break;

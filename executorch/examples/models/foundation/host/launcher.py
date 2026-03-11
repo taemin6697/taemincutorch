@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 import shlex
+import time
 from pathlib import Path
 
 from executorch.examples.models.foundation.manifest import (
@@ -14,6 +16,11 @@ from executorch.examples.models.foundation.manifest import (
 
 def _run(cmd: list[str]) -> int:
     return subprocess.run(cmd, check=True).returncode
+
+
+def _run_capture(cmd: list[str], *, check: bool = True) -> str:
+    proc = subprocess.run(cmd, check=check, capture_output=True, text=True)
+    return (proc.stdout or "") + (proc.stderr or "")
 
 
 def _artifact_root(manifest: FoundationManifest) -> Path:
@@ -76,6 +83,214 @@ def _adb_base(serial: str | None) -> list[str]:
     return cmd
 
 
+def _write_text(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+
+
+def _adb_shell_capture(adb: list[str], command: str, *, check: bool = True) -> str:
+    return _run_capture(adb + ["shell", command], check=check)
+
+
+def _capture_meminfo(adb: list[str], output_path: Path) -> None:
+    _write_text(output_path, _adb_shell_capture(adb, "cat /proc/meminfo", check=False))
+
+
+def _capture_process_memory_texts(adb: list[str], pid: int) -> tuple[str, str]:
+    dumpsys = _adb_shell_capture(adb, f"dumpsys meminfo {pid}", check=False).strip()
+    smaps_rollup = _adb_shell_capture(adb, f"cat /proc/{pid}/smaps_rollup", check=False).strip()
+    return dumpsys, smaps_rollup
+
+
+def _is_process_alive(adb: list[str], pid: int) -> bool:
+    out = _adb_shell_capture(
+        adb,
+        f"if [ -d /proc/{pid} ]; then echo alive; else echo dead; fi",
+        check=False,
+    )
+    return "alive" in out
+
+
+def _capture_process_memory(adb: list[str], pid: int, out_dir: Path) -> None:
+    dumpsys, smaps_rollup = _capture_process_memory_texts(adb, pid)
+    if not dumpsys:
+        dumpsys = f"[foundation] dumpsys meminfo unavailable for pid {pid}\n"
+    if not smaps_rollup:
+        smaps_rollup = f"[foundation] smaps_rollup unavailable for pid {pid}\n"
+    _write_text(out_dir / "android_dumpsys_meminfo.txt", dumpsys + "\n")
+    _write_text(out_dir / "android_smaps_rollup.txt", smaps_rollup + "\n")
+
+
+def _ensure_live_snapshot_files(out_dir: Path, pid: int) -> None:
+    dumpsys_path = out_dir / "android_dumpsys_meminfo.txt"
+    smaps_path = out_dir / "android_smaps_rollup.txt"
+    if not dumpsys_path.exists():
+        _write_text(dumpsys_path, f"[foundation] dumpsys meminfo unavailable for pid {pid}\n")
+    if not smaps_path.exists():
+        _write_text(smaps_path, f"[foundation] smaps_rollup unavailable for pid {pid}\n")
+
+
+def _extract_named_kb_value(text: str, name: str) -> int | None:
+    match = re.search(rf"^{re.escape(name)}:\s*(\d+)\s*kB$", text, flags=re.MULTILINE)
+    return int(match.group(1)) if match else None
+
+
+def _extract_dumpsys_summary_value(text: str, label: str) -> int | None:
+    match = re.search(rf"{re.escape(label)}:\s*(\d+)", text)
+    return int(match.group(1)) if match else None
+
+
+def _init_memory_timeline(path: Path) -> None:
+    _write_text(
+        path,
+        "elapsed_s,phase,pid_alive,dumpsys_total_pss_kb,dumpsys_total_rss_kb,"
+        "dumpsys_total_swap_kb,smaps_rss_kb,smaps_pss_kb,smaps_private_dirty_kb,"
+        "smaps_shared_clean_kb,mem_available_kb,cached_kb,dma_heap_pool_kb,"
+        "gpu_total_kb,kgsl_shmem_usage_kb\n",
+    )
+
+
+def _append_memory_timeline_sample(
+    timeline_path: Path,
+    *,
+    elapsed_s: float,
+    phase: str,
+    pid_alive: bool,
+    dumpsys: str,
+    smaps_rollup: str,
+    meminfo: str,
+) -> None:
+    row = [
+        f"{elapsed_s:.3f}",
+        phase,
+        "1" if pid_alive else "0",
+        str(_extract_dumpsys_summary_value(dumpsys, "TOTAL PSS") or ""),
+        str(_extract_dumpsys_summary_value(dumpsys, "TOTAL RSS") or ""),
+        str(_extract_dumpsys_summary_value(dumpsys, "TOTAL SWAP (KB)") or ""),
+        str(_extract_named_kb_value(smaps_rollup, "Rss") or ""),
+        str(_extract_named_kb_value(smaps_rollup, "Pss") or ""),
+        str(_extract_named_kb_value(smaps_rollup, "Private_Dirty") or ""),
+        str(_extract_named_kb_value(smaps_rollup, "Shared_Clean") or ""),
+        str(_extract_named_kb_value(meminfo, "MemAvailable") or ""),
+        str(_extract_named_kb_value(meminfo, "Cached") or ""),
+        str(_extract_named_kb_value(meminfo, "DmaHeapPool") or ""),
+        str(_extract_named_kb_value(meminfo, "GpuTotal") or ""),
+        str(_extract_named_kb_value(meminfo, "KgslShmemUsage") or ""),
+    ]
+    with timeline_path.open("a", encoding="utf-8") as f:
+        f.write(",".join(row) + "\n")
+
+
+def _capture_prelaunch_timeline(
+    adb: list[str],
+    timeline_path: Path,
+    *,
+    baseline_window_s: float = 2.0,
+    poll_interval_s: float = 0.02,
+) -> None:
+    start = time.monotonic()
+    next_sample_at = start
+    while True:
+        now = time.monotonic()
+        if now < next_sample_at:
+            time.sleep(next_sample_at - now)
+            continue
+        elapsed_s = now - start - baseline_window_s
+        meminfo = _adb_shell_capture(adb, "cat /proc/meminfo", check=False)
+        _append_memory_timeline_sample(
+            timeline_path,
+            elapsed_s=elapsed_s,
+            phase="prelaunch",
+            pid_alive=False,
+            dumpsys="",
+            smaps_rollup="",
+            meminfo=meminfo,
+        )
+        next_sample_at += poll_interval_s
+        if now - start >= baseline_window_s:
+            break
+
+
+def _start_remote_runner(
+    adb: list[str],
+    remote_root: str,
+    runner_cmd: str,
+) -> int:
+    remote_launch = (
+        f"cd {shlex.quote(remote_root)} && "
+        "rm -f foundation_output.txt foundation_proc.csv runner_stdout.txt runner.pid && "
+        "if command -v nohup >/dev/null 2>&1; then "
+        f"  nohup sh -c {shlex.quote(runner_cmd)} > runner_stdout.txt 2>&1 < /dev/null & "
+        "else "
+        f"  sh -c {shlex.quote(runner_cmd)} > runner_stdout.txt 2>&1 < /dev/null & "
+        "fi; "
+        "pid=$!; echo $pid > runner.pid; echo $pid"
+    )
+    pid_text = _adb_shell_capture(adb, remote_launch, check=False).strip()
+    pid_line = pid_text.splitlines()[-1].strip() if pid_text else ""
+    if not pid_line.isdigit():
+        raise RuntimeError(f"Failed to start runner on device. pid output: {pid_text}")
+    return int(pid_line)
+
+
+def _wait_for_process_exit(
+    adb: list[str],
+    pid: int,
+    out_dir: Path,
+    timeline_path: Path,
+    *,
+    poll_interval_s: float = 0.02,
+    detailed_interval_s: float = 0.5,
+    postrun_window_s: float = 3.0,
+) -> bool:
+    live_snapshot_taken = False
+    started_at = time.monotonic()
+    last_detailed_at = -1e18
+    while _is_process_alive(adb, pid):
+        sample_started_at = time.monotonic()
+        if not live_snapshot_taken:
+            _capture_process_memory(adb, pid, out_dir)
+            live_snapshot_taken = True
+        elapsed_s = sample_started_at - started_at
+        if elapsed_s - last_detailed_at >= detailed_interval_s:
+            dumpsys, smaps_rollup = _capture_process_memory_texts(adb, pid)
+            last_detailed_at = elapsed_s
+        else:
+            dumpsys, smaps_rollup = "", ""
+        meminfo = _adb_shell_capture(adb, "cat /proc/meminfo", check=False)
+        _append_memory_timeline_sample(
+            timeline_path,
+            elapsed_s=elapsed_s,
+            phase="running",
+            pid_alive=True,
+            dumpsys=dumpsys,
+            smaps_rollup=smaps_rollup,
+            meminfo=meminfo,
+        )
+        sleep_s = poll_interval_s - (time.monotonic() - sample_started_at)
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+    postrun_start = time.monotonic()
+    next_sample_at = postrun_start
+    while True:
+        now = time.monotonic()
+        if now < next_sample_at:
+            time.sleep(next_sample_at - now)
+            continue
+        _append_memory_timeline_sample(
+            timeline_path,
+            elapsed_s=now - started_at,
+            phase="postrun",
+            pid_alive=False,
+            dumpsys="",
+            smaps_rollup="",
+            meminfo=_adb_shell_capture(adb, "cat /proc/meminfo", check=False),
+        )
+        next_sample_at += poll_interval_s
+        if now - postrun_start >= postrun_window_s:
+            break
+    return live_snapshot_taken
+
+
 def _run_unified_xnnpack(
     manifest: FoundationManifest,
     manifest_path: Path,
@@ -90,13 +305,17 @@ def _run_unified_xnnpack(
     temperature: float | None,
     decode_after_frames: int | None = None,
     eval_mode: int = 0,
-    lazy_kv_alloc: bool = True,
+    lazy_kv_alloc: bool = False,
+    ignore_eos: bool = False,
     save_log: bool = False,
     stream: bool = False,
 ) -> int:
     from executorch.examples.models.foundation.host.frame_extractor import (
         extract_frames,
         extract_image,
+    )
+    from executorch.examples.models.foundation.host.memory_plot import (
+        generate_memory_timeline_plot,
     )
 
     adb = _adb_base(device)
@@ -139,6 +358,11 @@ def _run_unified_xnnpack(
         )
         local_output = out_dir / "foundation_output.txt"
         local_proc = out_dir / "foundation_proc.csv"
+        local_runner_stdout = out_dir / "device_runner_stdout.txt"
+        local_meminfo_before = out_dir / "android_proc_meminfo_before.txt"
+        local_meminfo_after = out_dir / "android_proc_meminfo_after.txt"
+        local_pid = out_dir / "android_runner_pid.txt"
+        local_timeline = out_dir / "android_memory_timeline.csv"
 
         device_manifest = manifest.resolve_paths(manifest_path.parent)
         rel_paths = {}
@@ -188,13 +412,29 @@ def _run_unified_xnnpack(
             f"--eval_mode={eval_mode}",
             f"--output_path=foundation_output.txt",
         ]
+        if ignore_eos:
+            args.append("--ignore_eos")
         for q in questions:
             args.extend(["--prompt", shlex.quote(q)])
         remote_proc = f"{remote_root}/foundation_proc.csv"
-        shell_cmd = f"cd {remote_root} && export LD_LIBRARY_PATH=. && ./xnnpack_qnn_runner " + " ".join(args)
-        _run(adb + ["shell", shell_cmd])
+        runner_cmd = "export LD_LIBRARY_PATH=. && ./xnnpack_qnn_runner " + " ".join(args)
+        _capture_meminfo(adb, local_meminfo_before)
+        _init_memory_timeline(local_timeline)
+        _capture_prelaunch_timeline(adb, local_timeline, baseline_window_s=2.0, poll_interval_s=0.1)
+        pid = _start_remote_runner(adb, remote_root, runner_cmd)
+        _write_text(local_pid, f"{pid}\n")
+        _wait_for_process_exit(adb, pid, out_dir, local_timeline)
+        _ensure_live_snapshot_files(out_dir, pid)
+        _capture_meminfo(adb, local_meminfo_after)
+        runner_stdout = _adb_shell_capture(adb, f"cd {remote_root} && cat runner_stdout.txt", check=False)
+        _write_text(local_runner_stdout, runner_stdout)
+        if runner_stdout.strip():
+            print(runner_stdout)
         _run(adb + ["pull", remote_output, str(local_output)])
-        return _run(adb + ["pull", remote_proc, str(local_proc)])
+        rc = _run(adb + ["pull", remote_proc, str(local_proc)])
+        if save_log:
+            generate_memory_timeline_plot(out_dir)
+        return rc
 
 
 def _run_unified_qnn(
@@ -213,7 +453,8 @@ def _run_unified_qnn(
     temperature: float | None,
     decode_after_frames: int | None = None,
     eval_mode: int = 0,
-    lazy_kv_alloc: bool = True,
+    lazy_kv_alloc: bool = False,
+    ignore_eos: bool = False,
     save_log: bool = False,
     stream: bool = False,
 ) -> int:
@@ -221,6 +462,9 @@ def _run_unified_qnn(
     from executorch.examples.models.foundation.host.frame_extractor import (
         extract_frames,
         extract_image,
+    )
+    from executorch.examples.models.foundation.host.memory_plot import (
+        generate_memory_timeline_plot,
     )
 
     qnn_sdk = os.environ.get("QNN_SDK_ROOT", "")
@@ -261,6 +505,11 @@ def _run_unified_qnn(
         )
         local_output = out_dir / "foundation_output.txt"
         local_proc = out_dir / "foundation_proc.csv"
+        local_runner_stdout = out_dir / "device_runner_stdout.txt"
+        local_meminfo_before = out_dir / "android_proc_meminfo_before.txt"
+        local_meminfo_after = out_dir / "android_proc_meminfo_after.txt"
+        local_pid = out_dir / "android_runner_pid.txt"
+        local_timeline = out_dir / "android_memory_timeline.csv"
 
         device_manifest = manifest.resolve_paths(manifest_path.parent)
         rel_paths = {}
@@ -277,6 +526,7 @@ def _run_unified_qnn(
             qnn_sdk=qnn_sdk,
             soc_model=model,
         )
+        adb_cmd = _adb_base(device)
         adb.setup_workspace()
         adb.push_qnn_libs()
         adb.push_file(str(runner_binary))
@@ -324,14 +574,33 @@ def _run_unified_qnn(
             f"--{'lazy_kv_alloc' if lazy_kv_alloc else 'nolazy_kv_alloc'}",
             "--output_path=foundation_output.txt",
         ]
+        if ignore_eos:
+            cmd.append("--ignore_eos")
         for q in questions:
             cmd.extend(["--prompt", shlex.quote(q)])
-        runner_out = adb.execute(" ".join(cmd))
-        if runner_out:
+        runner_cmd = " ".join(cmd)
+        _capture_meminfo(adb_cmd, local_meminfo_before)
+        _init_memory_timeline(local_timeline)
+        _capture_prelaunch_timeline(adb_cmd, local_timeline, baseline_window_s=2.0, poll_interval_s=0.1)
+        pid = _start_remote_runner(adb_cmd, ADBRunner.DEVICE_WORKSPACE, runner_cmd)
+        _write_text(local_pid, f"{pid}\n")
+        _wait_for_process_exit(adb_cmd, pid, out_dir, local_timeline)
+        _ensure_live_snapshot_files(out_dir, pid)
+        _capture_meminfo(adb_cmd, local_meminfo_after)
+        runner_out = _adb_shell_capture(
+            adb_cmd,
+            f"cd {ADBRunner.DEVICE_WORKSPACE} && cat runner_stdout.txt",
+            check=False,
+        )
+        _write_text(local_runner_stdout, runner_out)
+        if runner_out.strip():
             print(runner_out)
         try:
             _run(["adb", "-s", device, "pull", device_output, str(local_output)])
-            return _run(["adb", "-s", device, "pull", device_proc, str(local_proc)])
+            rc = _run(["adb", "-s", device, "pull", device_proc, str(local_proc)])
+            if save_log:
+                generate_memory_timeline_plot(out_dir)
+            return rc
         except subprocess.CalledProcessError:
             print(
                 "\n[foundation] 러너가 foundation_output.txt 또는 foundation_proc.csv 를 생성하지 못했습니다. "
@@ -357,7 +626,8 @@ def run_with_manifest(
     save_log: bool = False,
     stream: bool = False,
     runner_binary: str | None = None,
-    lazy_kv_alloc: bool = True,
+    lazy_kv_alloc: bool = False,
+    ignore_eos: bool = False,
 ) -> int:
     manifest = load_manifest(Path(manifest_path))
     artifact_root = _artifact_root(manifest)
@@ -388,6 +658,7 @@ def run_with_manifest(
             decode_after_frames=decode_after_frames,
             eval_mode=eval_mode,
             lazy_kv_alloc=lazy_kv_alloc,
+            ignore_eos=ignore_eos,
             save_log=save_log,
             stream=stream,
         )
@@ -411,6 +682,7 @@ def run_with_manifest(
             decode_after_frames=decode_after_frames,
             eval_mode=eval_mode,
             lazy_kv_alloc=lazy_kv_alloc,
+            ignore_eos=ignore_eos,
             save_log=save_log,
             stream=stream,
         )

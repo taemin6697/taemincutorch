@@ -54,6 +54,7 @@ void write_proc_header(std::ofstream& fproc) {
            "L_DecoderLoad: 텍스트 디코더 load  "
            "L_EmbeddingLoad: 토크나이저/텍스트 임베딩 load\n";
   fproc << "# V_Encode: col_a=vision_encode_ms (비전 인코더만)\n";
+  fproc << "# EmbeddingAndMerging: prompt build + tokenizer + text embedding + merge + decoder reload\n";
   fproc << "# T_Prefill: col_a=text_kv_prefill_ms  Decode: col_b=token_gen_ms\n";
   fproc << "# S: 256토큰 구간 경계  D: 토큰별 decode\n";
 }
@@ -386,6 +387,8 @@ class XnnpackBackendRunner final : public BackendRunner {
 
     std::ostringstream final_output;
     for (const auto& question : split_questions(config.questions)) {
+      const long rss_embed_merge_before = rss_kb();
+      const long t_embed_merge_start = time_in_ms();
       std::string full_prompt = build_full_prompt_text(config.frame_count, question);
       auto encoded = tokenizer->encode(full_prompt, 0, 0);
       ET_CHECK_MSG(encoded.ok(), "Failed to encode prompt for question");
@@ -406,6 +409,15 @@ class XnnpackBackendRunner final : public BackendRunner {
           manifest_.paths.text_decoder_pte,
           Module::LoadMode::MmapUseMlockIgnoreErrors);
       ET_CHECK_OK_OR_RETURN_ERROR(decoder_module.load_method("forward"));
+
+      const long t_embed_merge_end = time_in_ms();
+      const long rss_embed_merge_after = rss_kb();
+      fproc << "EmbeddingAndMerging,"
+            << (t_embed_merge_start - t_run_start) / 1000.0 << ","
+            << (t_embed_merge_end - t_run_start) / 1000.0 << ","
+            << rss_embed_merge_before << "," << rss_embed_merge_after << ","
+            << (t_embed_merge_end - t_embed_merge_start) << ",,"
+            << (t_embed_merge_end - t_embed_merge_start) << ",,,,,\n";
 
       const long rss_before_q = rss_kb();
       const long t_prefill_start = time_in_ms();
@@ -443,11 +455,12 @@ class XnnpackBackendRunner final : public BackendRunner {
         saw_first_token = true;
         answer << *first_piece;
         emitted_tokens += 1;
-        if (contains_stop_marker(*first_piece)) {
+        if (!config.ignore_eos && contains_stop_marker(*first_piece)) {
           goto finish_question;
         }
       }
-      if (cur_token == eos_token_id || stop_ids.count(cur_token) > 0) {
+      if (!config.ignore_eos &&
+          (cur_token == eos_token_id || stop_ids.count(cur_token) > 0)) {
         goto finish_question;
       }
 
@@ -493,11 +506,12 @@ class XnnpackBackendRunner final : public BackendRunner {
             segment_events.push_back(
                 {static_cast<double>(t_token_end - t_run_start) / 1000.0, rss_now, emitted_tokens});
           }
-          if (contains_stop_marker(*decode_piece)) {
+          if (!config.ignore_eos && contains_stop_marker(*decode_piece)) {
             break;
           }
         }
-        if (cur_token == eos_token_id || stop_ids.count(cur_token) > 0) {
+        if (!config.ignore_eos &&
+            (cur_token == eos_token_id || stop_ids.count(cur_token) > 0)) {
           break;
         }
       }

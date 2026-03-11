@@ -13,6 +13,7 @@ executorch/examples/models/foundation/
 ├── CMakeLists.txt
 ├── export.py
 ├── export_internvl3_all_lengths.sh
+├── KV_CACHE_README.md         # KV cache / shape 차이 정리
 ├── manifest.py
 ├── README.md
 ├── REQUIRED_FILES.md          # 이 파일
@@ -135,6 +136,8 @@ git commit -m "your local work"
 ```
 
 > 내부 개발 이력 보존용이므로, 꼭 먼저 commit 해야 하는 것은 아님.
+> 다만 **stream 저장소 이력도 남기고 싶으면 여기서 먼저 commit** 하고,
+> 그 다음 7-2, 7-3 단계로 `taemincutorch-twofolders` 에 반영하는 것을 권장.
 
 ### 7-2. 두 폴더만 배포용 저장소로 복사
 
@@ -173,3 +176,34 @@ git push --force https://github.com/taemin6697/taemincutorch.git HEAD:master
 
 - `/workspace/stream`: 개발
 - `/workspace/taemincutorch-twofolders`: 두 폴더만 커밋/강제 푸시
+
+### 7-6. 권장 순서 (내부 이력 + 외부 배포 둘 다 할 때)
+
+```bash
+# 1) 내부 개발 저장소 기록
+cd /workspace/stream
+git add .
+git commit -m "your local work"
+
+# 2) 외부 공개용 저장소 동기화
+rm -rf /workspace/taemincutorch-twofolders/executorch
+mkdir -p /workspace/taemincutorch-twofolders/executorch/examples/models
+mkdir -p /workspace/taemincutorch-twofolders/executorch/examples/qualcomm/oss_scripts
+
+cp -a /workspace/stream/executorch/examples/models/foundation \
+  /workspace/taemincutorch-twofolders/executorch/examples/models/
+
+cp -a /workspace/stream/executorch/examples/qualcomm/oss_scripts/llama \
+  /workspace/taemincutorch-twofolders/executorch/examples/qualcomm/oss_scripts/
+
+# 3) 외부 공개용 저장소 커밋/푸시
+cd /workspace/taemincutorch-twofolders
+find . -type d -name __pycache__ -prune -exec rm -rf {} +
+git add .
+git commit -m "update foundation and qualcomm llama"
+git push --force https://github.com/taemin6697/taemincutorch.git HEAD:master
+```
+
+- 먼저 `/workspace/stream` 에서 작업 이력을 남기고, 그 다음 `/workspace/taemincutorch-twofolders` 로 두 폴더만 복사해서 공개용 이력을 만든다.
+- 즉 개발용 저장소와 공개용 저장소를 분리해서 관리하는 흐름이다.
+- 공개용 push 에서 인증 에러가 나면, 마지막 `git push --force ...` 한 줄만 인증된 터미널에서 다시 실행하면 된다.
