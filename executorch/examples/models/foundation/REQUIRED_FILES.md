@@ -106,3 +106,70 @@ README의 빌드 절차 참고.
 ### 한 줄 정리
 - **XNNPACK**: `foundation/`만 복사하면 됨
 - **QNN**: `foundation/` + `qualcomm/oss_scripts/llama/` 전체 필요 (vanilla executorch에는 qualcomm 없을 수 있음 → 별도 추가 필요)
+
+---
+
+## 7. `taemin6697/taemincutorch` 에 두 폴더만 푸시하는 방법
+
+외부 공개용 저장소는 **두 폴더만 담는 별도 repo/worktree** 로 관리하는 것을 권장:
+
+- `executorch/examples/models/foundation`
+- `executorch/examples/qualcomm/oss_scripts/llama`
+
+권장 작업 방식:
+
+- 실제 개발/수정은 `/workspace/stream` 에서 진행
+- 외부 공개용 커밋/푸시는 `/workspace/taemincutorch-twofolders` 에서 진행
+
+즉, `/workspace/stream` 은 개발용 전체 저장소이고,
+`/workspace/taemincutorch-twofolders` 는 **두 폴더만 담는 배포용 저장소** 입니다.
+
+### 7-1. stream 에서 작업
+
+필요하면 먼저 `/workspace/stream` 에서 일반 git commit:
+
+```bash
+cd /workspace/stream
+git add .
+git commit -m "your local work"
+```
+
+> 내부 개발 이력 보존용이므로, 꼭 먼저 commit 해야 하는 것은 아님.
+
+### 7-2. 두 폴더만 배포용 저장소로 복사
+
+```bash
+rm -rf /workspace/taemincutorch-twofolders/executorch
+mkdir -p /workspace/taemincutorch-twofolders/executorch/examples/models
+mkdir -p /workspace/taemincutorch-twofolders/executorch/examples/qualcomm/oss_scripts
+
+cp -a /workspace/stream/executorch/examples/models/foundation \
+  /workspace/taemincutorch-twofolders/executorch/examples/models/
+
+cp -a /workspace/stream/executorch/examples/qualcomm/oss_scripts/llama \
+  /workspace/taemincutorch-twofolders/executorch/examples/qualcomm/oss_scripts/
+```
+
+### 7-3. 배포용 저장소에서 커밋/푸시
+
+```bash
+cd /workspace/taemincutorch-twofolders
+
+find . -type d -name __pycache__ -prune -exec rm -rf {} +
+
+git add .
+git commit -m "update foundation and qualcomm llama"
+git push --force https://github.com/taemin6697/taemincutorch.git HEAD:master
+```
+
+### 7-4. 왜 이렇게 하나?
+
+- 실수로 다른 폴더가 같이 올라가는 것 방지
+- 빌드 산출물/실험 파일/문서가 섞이는 것 방지
+- 공개용 repo 를 항상 두 폴더만 있는 상태로 유지
+- 대용량 불필요 파일이 push 에 섞일 가능성 감소
+
+### 7-5. 한 줄 요약
+
+- `/workspace/stream`: 개발
+- `/workspace/taemincutorch-twofolders`: 두 폴더만 커밋/강제 푸시

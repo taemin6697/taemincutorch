@@ -368,6 +368,7 @@ python -m executorch.examples.models.foundation.cli run ...
 
 현재 XNNPACK foundation run은 `xnnpack_qnn_runner` 기반 split-PTE 경로만 지원합니다.
 `--runner_binary` 에는 **Android용** 바이너리 경로를 사용합니다.
+실행 결과를 `my_save/save_log/cpu/...` 아래에 저장하려면 `--save_log` 를 추가합니다.
 
 ```bash
 cd /workspace/stream
@@ -378,7 +379,9 @@ python -m executorch.examples.models.foundation.cli run \
   --device R3KYC01FW1P \
   --image http://images.cocodataset.org/val2017/000000039769.jpg \
   --questions "Describe this image briefly using around 10 words." \
-  --temperature 0.0
+  --temperature 0.0 \
+  --lazy_kv_alloc \
+  --save_log
 ```
 
 비디오 입력을 쓸 때는 `--image` 대신 `--video` 를 사용합니다.
@@ -393,14 +396,28 @@ python -m executorch.examples.models.foundation.cli run \
   --video /workspace/stream/my_save/sample_video/sample.mp4 \
   --questions "Describe this video briefly using around 10 words." \
   --temperature 0.0 \
-  --decode_after_frames 3
+  --decode_after_frames 3 \
+  --lazy_kv_alloc \
+  --save_log
 
+```
+
+> 현재 foundation XNNPACK 경로에서는 `--lazy_kv_alloc` 가 QNN처럼 실제 KV 물리 할당 전략을 바꾸지는 않습니다.  
+> 다만 실행 파라미터 및 save_log 폴더명은 `lazy` 기준으로 기록합니다.
+
+예를 들어 위 비디오 실행은 아래 폴더에 저장됩니다.
+
+```text
+/workspace/stream/my_save/save_log/cpu/internvl3_1b_kv_batch_seq2048_video_fps1p0_frames3_eval0_lazy/
+  foundation_output.txt
+  foundation_proc.csv
 ```
 
 ### QNN 실행
 
 QNN은 추가로 build path, device serial, model 이름이 필요합니다.
 또한 환경변수 `QNN_SDK_ROOT` 가 설정되어 있어야 합니다.
+실행 결과를 `my_save/save_log/qnn/...` 아래에 저장하려면 `--save_log` 를 추가합니다.
 
 ```bash
 export QNN_SDK_ROOT=/path/to/qnn_sdk
@@ -415,7 +432,9 @@ python -m executorch.examples.models.foundation.cli run \
   -m SM8750 \
   --image http://images.cocodataset.org/val2017/000000039769.jpg \
   --questions "Describe this image briefly using around 10 words." \
-  --temperature 0.0
+  --temperature 0.0 \
+  --lazy_kv_alloc \
+  --save_log
 ```
 
 비디오 입력 예시:
@@ -434,15 +453,29 @@ python -m executorch.examples.models.foundation.cli run \
   --video /workspace/stream/my_save/sample_video/sample.mp4 \
   --questions "Describe this video briefly using around 10 words." \
   --temperature 0.0 \
-  --decode_after_frames 3
+  --decode_after_frames 3 \
+  --lazy_kv_alloc \
+  --save_log
 ```
 
 - `--decode_after_frames N`: 비디오에서 첫 N프레임만 사용 후 질문 처리 (미지정 시 전체)
+- `--save_log`: `my_save/save_log/cpu/<파라미터폴더>/` 또는 `my_save/save_log/qnn/<파라미터폴더>/` 아래에 `foundation_output.txt`, `foundation_proc.csv` 저장
+- `--lazy_kv_alloc`: QNN에서 KV cache를 `mmap+MAP_NORESERVE`로 lazy 물리 할당
+- `--no-lazy_kv_alloc`: QNN에서 KV cache를 `std::vector`로 즉시 전체 할당
+
+예를 들어 위 QNN 비디오 실행은 아래 폴더에 저장됩니다.
+
+```text
+/workspace/stream/my_save/save_log/qnn/internvl3_1b_hybrid_batch_seq2048_video_fps1p0_frames3_eval1_lazy/
+  foundation_output.txt
+  foundation_proc.csv
+```
 
 현재 launcher 동작은 다음과 같습니다.
 
 - XNNPACK은 Android용 `executorch/build-android-xnnpack/foundation/xnnpack_qnn_runner` 사용
 - QNN은 Android용 `executorch/build-android/foundation/xnnpack_qnn_runner` 사용
+- `--save_log` 사용 시 실행 파라미터 기반 폴더명을 만들어 `my_save/save_log/cpu/` 또는 `my_save/save_log/qnn/` 아래에 저장
 - 기존 backend 스크립트 fallback 없음
 
 ## 여러 질문 넣는 법
@@ -457,7 +490,8 @@ python -m executorch.examples.models.foundation.cli run \
   --runner_binary /workspace/stream/executorch/build-android-xnnpack/foundation/xnnpack_qnn_runner \
   --device <adb_serial> \
   --image /workspace/stream/REPLACE_ME_IMAGE.jpg \
-  --questions "What is happening?" "What color is the object?"
+  --questions "What is happening?" "What color is the object?" \
+  --lazy_kv_alloc
 ```
 
 
@@ -477,6 +511,7 @@ runner는 Android용 바이너리이므로 디바이스에 push 후 `adb shell` 
 - `--prompt=...` (여러 개 가능)
 - `--seq_len=128`
 - `--temperature=0.0`
+- `--lazy_kv_alloc` (QNN만 실제 의미 있음)
 - `--output_path=foundation_output.txt`
 
 예시 (디바이스 내 경로 기준):

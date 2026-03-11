@@ -42,6 +42,7 @@ struct UnifiedRunConfig {
   int seq_len{128};
   double temperature{0.0};
   int eval_mode{0};
+  bool lazy_kv_alloc{true};
   bool stream{false};
   bool save_log{false};
   std::string output_path;

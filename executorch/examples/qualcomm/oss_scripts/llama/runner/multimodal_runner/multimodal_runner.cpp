@@ -643,7 +643,13 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
   }
 
   int64_t num_generated_tokens = ET_UNWRAP(token_generator_->generate(
-      prompt_tokens, cur_pos_, seq_len, token_callback, dump_logits, nullptr));
+      prompt_tokens,
+      cur_pos_,
+      seq_len,
+      token_callback,
+      dump_logits,
+      nullptr,
+      config.per_token_timing_cb));
   stats_.inference_end_ms = time_in_ms();
   ET_LOG(
       Info,

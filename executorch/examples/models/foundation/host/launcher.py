@@ -20,6 +20,55 @@ def _artifact_root(manifest: FoundationManifest) -> Path:
     return Path(manifest.paths["artifact_root"]).resolve()
 
 
+def _workspace_root() -> Path:
+    return Path(__file__).resolve().parents[5]
+
+
+def _eval_mode_name(eval_mode: int) -> str:
+    return {0: "kv", 1: "hybrid", 2: "lookahead"}.get(eval_mode, f"eval{eval_mode}")
+
+
+def _save_log_dir(
+    manifest: FoundationManifest,
+    *,
+    image: str | None,
+    video: str | None,
+    frame_count: int,
+    seq_len: int | None,
+    eval_mode: int,
+    stream: bool,
+    lazy_kv_alloc: bool,
+) -> Path:
+    input_type = "video" if video else ("image" if image else "text")
+    run_type = "stream" if stream else "batch"
+    fps_tag = "1p0"
+    lazy_tag = "lazy" if lazy_kv_alloc else "nolazy"
+    if manifest.variant.startswith(f"{manifest.model_family}_"):
+        model_tag = manifest.variant
+    else:
+        model_tag = f"{manifest.model_family}_{manifest.variant}"
+    seq_tag = f"seq{seq_len or manifest.export.get('max_seq_len', 1024)}"
+    frame_tag = f"frames{frame_count}"
+    folder_name = "_".join(
+        [
+            model_tag,
+            _eval_mode_name(eval_mode),
+            run_type,
+            seq_tag,
+            input_type,
+            f"fps{fps_tag}",
+            frame_tag,
+            f"eval{eval_mode}",
+            lazy_tag,
+        ]
+    )
+    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in folder_name)
+    backend_dir = "qnn" if manifest.backend == "qnn" else "cpu"
+    out_dir = _workspace_root() / "my_save" / "save_log" / backend_dir / safe_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
 def _adb_base(serial: str | None) -> list[str]:
     cmd = ["adb"]
     if serial:
@@ -41,7 +90,9 @@ def _run_unified_xnnpack(
     temperature: float | None,
     decode_after_frames: int | None = None,
     eval_mode: int = 0,
+    lazy_kv_alloc: bool = True,
     save_log: bool = False,
+    stream: bool = False,
 ) -> int:
     from executorch.examples.models.foundation.host.frame_extractor import (
         extract_frames,
@@ -71,6 +122,23 @@ def _run_unified_xnnpack(
             )
         else:
             raise SystemExit("XNNPACK unified run requires --image or --video")
+
+        out_dir = (
+            _save_log_dir(
+                manifest,
+                image=image,
+                video=video,
+                frame_count=frame_count,
+                seq_len=seq_len,
+                eval_mode=eval_mode,
+                stream=stream,
+                lazy_kv_alloc=lazy_kv_alloc,
+            )
+            if save_log
+            else Path.cwd()
+        )
+        local_output = out_dir / "foundation_output.txt"
+        local_proc = out_dir / "foundation_proc.csv"
 
         device_manifest = manifest.resolve_paths(manifest_path.parent)
         rel_paths = {}
@@ -122,11 +190,11 @@ def _run_unified_xnnpack(
         ]
         for q in questions:
             args.extend(["--prompt", shlex.quote(q)])
-        if save_log:
-            args.append("--save_log")
+        remote_proc = f"{remote_root}/foundation_proc.csv"
         shell_cmd = f"cd {remote_root} && export LD_LIBRARY_PATH=. && ./xnnpack_qnn_runner " + " ".join(args)
         _run(adb + ["shell", shell_cmd])
-        return _run(adb + ["pull", remote_output, str(Path.cwd() / "foundation_output.txt")])
+        _run(adb + ["pull", remote_output, str(local_output)])
+        return _run(adb + ["pull", remote_proc, str(local_proc)])
 
 
 def _run_unified_qnn(
@@ -145,7 +213,9 @@ def _run_unified_qnn(
     temperature: float | None,
     decode_after_frames: int | None = None,
     eval_mode: int = 0,
+    lazy_kv_alloc: bool = True,
     save_log: bool = False,
+    stream: bool = False,
 ) -> int:
     from executorch.examples.models.foundation.host.adb_runner import ADBRunner
     from executorch.examples.models.foundation.host.frame_extractor import (
@@ -174,6 +244,23 @@ def _run_unified_qnn(
             )
         else:
             frame_count = 0
+
+        out_dir = (
+            _save_log_dir(
+                manifest,
+                image=image,
+                video=video,
+                frame_count=frame_count,
+                seq_len=seq_len,
+                eval_mode=eval_mode,
+                stream=stream,
+                lazy_kv_alloc=lazy_kv_alloc,
+            )
+            if save_log
+            else Path.cwd()
+        )
+        local_output = out_dir / "foundation_output.txt"
+        local_proc = out_dir / "foundation_proc.csv"
 
         device_manifest = manifest.resolve_paths(manifest_path.parent)
         rel_paths = {}
@@ -219,6 +306,7 @@ def _run_unified_qnn(
             raise SystemExit("QNN foundation 실행에는 --image 또는 --video 가 필요합니다.")
 
         device_output = f"{ADBRunner.DEVICE_WORKSPACE}/foundation_output.txt"
+        device_proc = f"{ADBRunner.DEVICE_WORKSPACE}/foundation_proc.csv"
         cmd = [
             "chmod +x ./xnnpack_qnn_runner &&",
             "export LD_LIBRARY_PATH=. &&",
@@ -233,20 +321,20 @@ def _run_unified_qnn(
             f"--seq_len={seq_len or manifest.export.get('max_seq_len', 1024)}",
             f"--temperature={temperature if temperature is not None else 0.0}",
             f"--eval_mode={eval_mode}",
+            f"--{'lazy_kv_alloc' if lazy_kv_alloc else 'nolazy_kv_alloc'}",
             "--output_path=foundation_output.txt",
         ]
         for q in questions:
             cmd.extend(["--prompt", shlex.quote(q)])
-        if save_log:
-            cmd.append("--save_log")
         runner_out = adb.execute(" ".join(cmd))
         if runner_out:
             print(runner_out)
         try:
-            return _run(["adb", "-s", device, "pull", device_output, str(Path.cwd() / "foundation_output.txt")])
+            _run(["adb", "-s", device, "pull", device_output, str(local_output)])
+            return _run(["adb", "-s", device, "pull", device_proc, str(local_proc)])
         except subprocess.CalledProcessError:
             print(
-                "\n[foundation] 러너가 foundation_output.txt 를 생성하지 못했습니다. "
+                "\n[foundation] 러너가 foundation_output.txt 또는 foundation_proc.csv 를 생성하지 못했습니다. "
                 "위 디바이스 출력을 확인하세요."
             )
             raise
@@ -269,6 +357,7 @@ def run_with_manifest(
     save_log: bool = False,
     stream: bool = False,
     runner_binary: str | None = None,
+    lazy_kv_alloc: bool = True,
 ) -> int:
     manifest = load_manifest(Path(manifest_path))
     artifact_root = _artifact_root(manifest)
@@ -298,7 +387,9 @@ def run_with_manifest(
             temperature=temperature,
             decode_after_frames=decode_after_frames,
             eval_mode=eval_mode,
+            lazy_kv_alloc=lazy_kv_alloc,
             save_log=save_log,
+            stream=stream,
         )
 
     if manifest.backend == "xnnpack":
@@ -319,7 +410,9 @@ def run_with_manifest(
             temperature=temperature,
             decode_after_frames=decode_after_frames,
             eval_mode=eval_mode,
+            lazy_kv_alloc=lazy_kv_alloc,
             save_log=save_log,
+            stream=stream,
         )
 
     raise SystemExit(f"지원하지 않는 backend: {manifest.backend}")

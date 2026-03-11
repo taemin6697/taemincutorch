@@ -50,6 +50,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         temperature=args.temperature,
         decode_after_frames=args.decode_after_frames,
         eval_mode=eval_mode,
+        lazy_kv_alloc=args.lazy_kv_alloc,
         save_log=args.save_log,
         stream=args.stream,
         runner_binary=args.runner_binary,
@@ -160,6 +161,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="0=KV, 1=Hybrid, 2=Lookahead. 미지정 시 QNN→1, XNNPACK→0 자동.",
+    )
+    run_parser.add_argument(
+        "--lazy_kv_alloc",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="QNN KV cache lazy 물리 할당(mmap, 기본값) 또는 즉시 전체 할당(std::vector).",
     )
     run_parser.add_argument("--stream", action="store_true")
     run_parser.add_argument("--save_log", action="store_true")
