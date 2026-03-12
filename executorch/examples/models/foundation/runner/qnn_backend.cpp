@@ -7,12 +7,16 @@
  */
 
 #include <executorch/examples/models/foundation/runner/backend.h>
+#include <executorch/examples/models/foundation/runner/internal_memory_sampler.h>
 
 #ifdef FOUNDATION_ENABLE_QNN
+#include <executorch/backends/qualcomm/runtime/QnnExecuTorch.h>
+#include <executorch/devtools/etdump/etdump_flatcc.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/encoder.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/multimodal_runner.h>
 #include <executorch/extension/llm/runner/util.h>
 #include <executorch/extension/module/module.h>
+#include <executorch/runtime/backend/interface.h>
 #endif
 #include <executorch/runtime/platform/log.h>
 
@@ -43,7 +47,7 @@ long rss_kb() {
 void write_proc_header(std::ofstream& fproc) {
   fproc << "row_type,elapsed_s_start,elapsed_s_end,rss_kb_start,rss_kb_end,"
            "col_a_ms,col_b_ms,total_ms,kv_pos,kv_total,kv_used_pct,"
-           "kv_used_kb,kv_total_kb,token_idx\n";
+           "kv_estimated_used_kb,kv_total_kb,kv_physical_committed_kb,token_idx\n";
   fproc << "# L: Loading (전체)  L_VisionLoad: 비전 인코더 load  "
            "L_DecoderLoad: 텍스트 디코더/러너 load  "
            "L_EmbeddingLoad: 텍스트 임베딩 모듈 준비\n";
@@ -110,13 +114,44 @@ executorch::runtime::Error run_batch_qnn(
   using ::executorch::extension::Module;
 
   const long t_run_start = time_in_ms();
-  const std::string proc_csv_path = kFoundationProcCsv;
+  const std::string proc_csv_path =
+      config.proc_path.empty() ? kFoundationProcCsv : config.proc_path;
   std::ofstream fproc(proc_csv_path);
   ET_CHECK_MSG(
       fproc.is_open(),
       "Failed to open proc csv file: %s",
       proc_csv_path.c_str());
   write_proc_header(fproc);
+  fproc.flush();
+
+  // QNN 프로파일링 활성화 (모듈 로드 전에 호출)
+  {
+    executorch::runtime::BackendOptions<3> qnn_opts;
+    if (qnn_opts.set_option(QNN_RUNTIME_PROFILE_LEVEL, 2) ==
+        executorch::runtime::Error::Ok) {
+      auto err =
+          executorch::runtime::set_option(QNN_BACKEND, qnn_opts.view());
+      if (err == executorch::runtime::Error::Ok) {
+        ET_LOG(Info, "QNN profiling enabled (kProfileDetailed)");
+      }
+    }
+  }
+
+  // ADB처럼 runner 프로세스 시작 시점(0초)부터 샘플링
+  example::MultimodalRunner<T>* runner_ptr = nullptr;
+  InternalMemorySampler memory_sampler(
+      "android_memory_timeline.csv",
+      [&runner_ptr]() {
+        if (!runner_ptr) {
+          return BackendMemoryMetrics{0, 0};
+        }
+        return BackendMemoryMetrics{
+            static_cast<long>(runner_ptr->get_kv_cache_resident_bytes() / 1024),
+            static_cast<long>(runner_ptr->get_kv_cache_total_bytes() / 1024),
+        };
+      });
+  memory_sampler.start();
+
   const long rss_load_start = rss_kb();
   const long t_load_start = t_run_start;
 
@@ -144,9 +179,14 @@ executorch::runtime::Error run_batch_qnn(
   const long rss_embedding_after = rss_kb();
   const long rss_decoder_before = rss_kb();
   const long t_decoder_load_start = time_in_ms();
+  std::unique_ptr<executorch::runtime::EventTracer> event_tracer = nullptr;
+  if (!config.etdump_path.empty()) {
+    event_tracer = std::make_unique<executorch::etdump::ETDumpGen>();
+  }
   auto decoder_module = std::make_unique<Module>(
       manifest.paths.text_decoder_pte,
-      Module::LoadMode::MmapUseMlockIgnoreErrors);
+      Module::LoadMode::MmapUseMlockIgnoreErrors,
+      std::move(event_tracer));
   const long t_decoder_construct_end = time_in_ms();
   const long rss_decoder_construct_after = rss_kb();
 
@@ -178,7 +218,7 @@ executorch::runtime::Error run_batch_qnn(
           << (t_encode_end - t_run_start) / 1000.0 << ","
           << rss_before_encode << "," << rss_after_encode << ","
           << (t_encode_end - t_encode_start) << ",,"
-          << (t_encode_end - t_encode_start) << ",,,,,\n";
+          << (t_encode_end - t_encode_start) << ",,,,,,\n";
       vision_rows.push_back(oss.str());
     }
   }
@@ -199,6 +239,7 @@ executorch::runtime::Error run_batch_qnn(
       /*window=*/0,
       /*gcap=*/0,
       /*image_hidden_states=*/nullptr);
+  runner_ptr = &runner;
 
   const long t_runner_load_start = time_in_ms();
   ET_CHECK_OK_OR_RETURN_ERROR(runner.load());
@@ -211,26 +252,27 @@ executorch::runtime::Error run_batch_qnn(
           << (t_encoder_load_end - t_run_start) / 1000.0 << ","
           << rss_encoder_before << "," << rss_encoder_after << ","
           << (t_encoder_load_end - t_encoder_load_start) << ",,"
-          << (t_encoder_load_end - t_encoder_load_start) << ",,,,,\n";
+          << (t_encoder_load_end - t_encoder_load_start) << ",,,,,,\n";
   }
   fproc << "L_EmbeddingLoad," << (t_embedding_load_start - t_run_start) / 1000.0 << ","
         << (t_embedding_load_end - t_run_start) / 1000.0 << ","
         << rss_embedding_before << "," << rss_embedding_after << ","
         << (t_embedding_load_end - t_embedding_load_start) << ",,"
-        << (t_embedding_load_end - t_embedding_load_start) << ",,,,,\n";
+        << (t_embedding_load_end - t_embedding_load_start) << ",,,,,,\n";
   fproc << "L_DecoderLoad," << (t_decoder_load_start - t_run_start) / 1000.0 << ","
         << (t_runner_load_end - t_run_start) / 1000.0 << ","
         << rss_decoder_before << "," << rss_decoder_after << ","
         << (t_runner_load_end - t_decoder_load_start) << ",,"
-        << (t_runner_load_end - t_decoder_load_start) << ",,,,,\n";
+        << (t_runner_load_end - t_decoder_load_start) << ",,,,,,\n";
   fproc << "L," << (t_load_start - t_run_start) / 1000.0 << ","
         << (t_load_end - t_run_start) / 1000.0 << ","
         << rss_load_start << "," << rss_load_end << ","
         << (t_load_end - t_load_start) << ",,"
-        << (t_load_end - t_load_start) << ",,,,,\n";
+        << (t_load_end - t_load_start) << ",,,,,,\n";
   for (const auto& row : vision_rows) {
     fproc << row;
   }
+  fproc.flush();
   (void)t_decoder_construct_end;
   (void)rss_decoder_construct_after;
   if (config.frame_count > 0 && !concat_buffer.empty()) {
@@ -243,7 +285,7 @@ executorch::runtime::Error run_batch_qnn(
   executorch::extension::llm::GenerationConfig gen_config{
       /*echo=*/true,
       /*ignore_eos=*/config.ignore_eos,
-      /*max_new_tokens=*/-1,
+      /*max_new_tokens=*/config.max_new_tokens,
       /*warming=*/false,
       /*seq_len=*/config.seq_len,
       /*temperature=*/static_cast<float>(config.temperature),
@@ -268,6 +310,7 @@ executorch::runtime::Error run_batch_qnn(
       double elapsed_s;
       long rss_kb;
       int64_t token_count;
+      int64_t kv_physical_committed_kb;
     };
     constexpr int kSegmentSize = 256;
     std::vector<SegmentEvent> segment_events;
@@ -280,8 +323,12 @@ executorch::runtime::Error run_batch_qnn(
       rss_at_first_token.compare_exchange_strong(expected, rss_kb());
       const int64_t count = token_count.fetch_add(1) + 1;
       if (count % kSegmentSize == 0) {
-        segment_events.push_back(
-            {static_cast<double>(time_in_ms() - t_run_start) / 1000.0, rss_kb(), count});
+        segment_events.push_back({
+            static_cast<double>(time_in_ms() - t_run_start) / 1000.0,
+            rss_kb(),
+            count,
+            static_cast<int64_t>(runner.get_kv_cache_resident_bytes() / 1024),
+        });
       }
     };
     auto stats_cb = [&](const executorch::extension::llm::Stats& s) {
@@ -300,16 +347,19 @@ executorch::runtime::Error run_batch_qnn(
       const int64_t kv_total_kb = kv_total_bytes > 0
           ? static_cast<int64_t>(kv_total_bytes / 1024)
           : 0;
-      const int64_t kv_used_kb = (kv_ctx > 0 && kv_total_kb > 0)
+      const int64_t kv_estimated_used_kb = (kv_ctx > 0 && kv_total_kb > 0)
           ? (kv_pos * kv_total_kb) / kv_ctx
           : 0;
+      const int64_t kv_physical_committed_kb = static_cast<int64_t>(
+          runner.get_kv_cache_resident_bytes() / 1024);
       const double kv_pct = kv_ctx > 0 ? 100.0 * kv_pos / kv_ctx : 0.0;
       std::ostringstream oss;
       oss << "D," << start_s << "," << end_s << ","
           << rss << "," << rss << ","
           << "," << (end_ms - start_ms) << "," << (end_ms - start_ms) << ","
           << kv_pos << "," << kv_ctx << "," << kv_pct << ","
-          << kv_used_kb << "," << kv_total_kb << ","
+          << kv_estimated_used_kb << "," << kv_total_kb << ","
+          << kv_physical_committed_kb << ","
           << token_idx << "\n";
       d_rows_buffer.push_back(oss.str());
     };
@@ -353,12 +403,14 @@ executorch::runtime::Error run_batch_qnn(
         ? static_cast<int64_t>(kv_total_bytes_q / 1024)
         : 0;
     const int64_t kv_prefill = kv_before_q + num_prompt_tokens;
-    const int64_t kv_used_kb_prefill = (kv_ctx > 0 && kv_total_kb_q > 0)
+    const int64_t kv_estimated_used_kb_prefill = (kv_ctx > 0 && kv_total_kb_q > 0)
         ? (kv_prefill * kv_total_kb_q) / kv_ctx
         : 0;
-    const int64_t kv_used_kb_q = (kv_ctx > 0 && kv_total_kb_q > 0)
+    const int64_t kv_estimated_used_kb_q = (kv_ctx > 0 && kv_total_kb_q > 0)
         ? (kv_after * kv_total_kb_q) / kv_ctx
         : 0;
+    const int64_t kv_physical_committed_kb_q = static_cast<int64_t>(
+        runner.get_kv_cache_resident_bytes() / 1024);
     const double kv_pct_prefill =
         kv_ctx > 0 ? 100.0 * kv_prefill / kv_ctx : 0.0;
     const double kv_after_pct = kv_ctx > 0 ? 100.0 * kv_after / kv_ctx : 0.0;
@@ -368,7 +420,7 @@ executorch::runtime::Error run_batch_qnn(
             << (em_timing.end_ms - t_run_start) / 1000.0 << ","
             << em_timing.rss_kb_start << "," << em_timing.rss_kb_end << ","
             << (em_timing.end_ms - em_timing.start_ms) << ",,"
-            << (em_timing.end_ms - em_timing.start_ms) << ",,,,,\n";
+            << (em_timing.end_ms - em_timing.start_ms) << ",,,,,,\n";
     }
     fproc << "T_Prefill," << elapsed_prefill_start << ","
           << elapsed_prefill_end << ","
@@ -381,7 +433,7 @@ executorch::runtime::Error run_batch_qnn(
                                    : text_kv_prefill_ms)
           << ","
           << kv_prefill << "," << kv_ctx << "," << kv_pct_prefill << ","
-          << kv_used_kb_prefill << "," << kv_total_kb_q << ",\n";
+          << kv_estimated_used_kb_prefill << "," << kv_total_kb_q << ",,\n";
     fproc << "Decode," << elapsed_decode_start << "," << elapsed_decode_end << ","
           << (has_internal_decode ? decode_timing.rss_kb_start : rss_first) << ","
           << (has_internal_decode ? decode_timing.rss_kb_end : rss_q) << ","
@@ -391,26 +443,32 @@ executorch::runtime::Error run_batch_qnn(
           << (has_internal_decode ? (decode_timing.end_ms - decode_timing.start_ms) : q_gen_ms)
           << ","
           << kv_after << "," << kv_ctx << "," << kv_after_pct << ","
-          << kv_used_kb_q << "," << kv_total_kb_q << ",\n";
+          << kv_estimated_used_kb_q << "," << kv_total_kb_q << ","
+          << kv_physical_committed_kb_q << ",\n";
     for (const auto& row : d_rows_buffer) {
       fproc << row;
     }
     for (const auto& seg : segment_events) {
       const int64_t seg_kv_pos = kv_prefill + seg.token_count;
-      const int64_t seg_kv_used_kb = (kv_ctx > 0 && kv_total_kb_q > 0)
+      const int64_t seg_kv_estimated_used_kb = (kv_ctx > 0 && kv_total_kb_q > 0)
           ? (seg_kv_pos * kv_total_kb_q) / kv_ctx
           : 0;
       const double seg_kv_pct = kv_ctx > 0 ? 100.0 * seg_kv_pos / kv_ctx : 0.0;
       fproc << "S," << seg.elapsed_s << "," << seg.elapsed_s << ","
             << seg.rss_kb << "," << seg.rss_kb << ",,,,"
             << seg_kv_pos << "," << kv_ctx << "," << seg_kv_pct << ","
-            << seg_kv_used_kb << "," << kv_total_kb_q << ",\n";
+            << seg_kv_estimated_used_kb << "," << kv_total_kb_q << ","
+            << seg.kv_physical_committed_kb << ",\n";
     }
     fproc.flush();
 
     std::string answer(out_buf.begin(), out_buf.end());
     fout << answer << "\n";
   }
+  if (!config.etdump_path.empty()) {
+    runner.write_etdump(config.etdump_path);
+  }
+  memory_sampler.stop();
   return executorch::runtime::Error::Ok;
 }
 

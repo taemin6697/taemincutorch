@@ -34,7 +34,6 @@ DEFINE_string(tokenizer_path, "tokenizer.bin", "Tokenizer path.");
 
 // Output
 DEFINE_string(output_path, "outputs.txt", "Output file path.");
-DEFINE_string(proc_path, "", "Proc CSV path (default: foundation_proc.csv in cwd).");
 DEFINE_string(performance_output_path, "inference_speed.txt", "Inference speed log.");
 DEFINE_string(dump_logits_path, "", "Dump logits path (KV mode only).");
 
@@ -48,15 +47,9 @@ DEFINE_string(system_prompt, "", "System prompt.");
 
 // Generation
 DEFINE_double(temperature, 0.0f, "Sampling temperature.");
-DEFINE_int32(seq_len, 128, "Max tokens to generate (or total context when used with GenerationConfig).");
-DEFINE_int32(max_new_tokens, -1, "Max new tokens to generate. If >=0, overrides seq_len semantics.");
-DEFINE_bool(ignore_eos, false, "Ignore EOS/stop token and continue until seq_len.");
+DEFINE_int32(seq_len, 128, "Max tokens to generate.");
 DEFINE_int32(eval_mode, 1, "0=KV, 1=Hybrid, 2=Lookahead.");
 DEFINE_bool(shared_buffer, false, "Use shared buffers (QNN).");
-DEFINE_bool(
-    lazy_kv_alloc,
-    false,
-    "QNN KV cache lazy physical allocation via mmap(true). Default is eager std::vector(false).");
 
 // Lookahead
 DEFINE_int32(ngram, 0, "Lookahead ngram size.");
@@ -64,11 +57,6 @@ DEFINE_int32(window, 0, "Lookahead window.");
 DEFINE_int32(gcap, 0, "Lookahead gcap.");
 
 DEFINE_int32(num_iters, 1, "Number of iterations.");
-
-DEFINE_string(
-    etdump_path,
-    "",
-    "Path to write QNN profiling etdump (relative to cwd). Used with save_log.");
 
 std::vector<std::string> CollectPrompts(int argc, char** argv) {
   std::vector<std::string> prompts;
@@ -83,7 +71,6 @@ std::vector<std::string> CollectPrompts(int argc, char** argv) {
 
 #ifdef FOUNDATION_ENABLE_QNN
 #include <executorch/backends/qualcomm/runtime/QnnExecuTorch.h>
-#include <executorch/devtools/etdump/etdump_flatcc.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/encoder.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/multimodal_runner.h>
 #include <executorch/extension/module/module.h>
@@ -212,7 +199,7 @@ void run_qnn_multimodal(
       static_cast<float>(FLAGS_temperature),
       FLAGS_eval_mode,
       FLAGS_shared_buffer,
-      FLAGS_lazy_kv_alloc,
+      /*lazy_kv_alloc=*/true,
       FLAGS_ngram,
       FLAGS_window,
       FLAGS_gcap,
@@ -230,7 +217,7 @@ void run_qnn_multimodal(
   };
 
   executorch::extension::llm::GenerationConfig config{
-      true, FLAGS_ignore_eos, -1, false, FLAGS_seq_len,
+      true, false, -1, false, FLAGS_seq_len,
       static_cast<float>(FLAGS_temperature), 0, 0};
 
   int32_t img_seq_len = encoder_runner->get_image_seq_len();
@@ -250,10 +237,6 @@ void run_qnn_multimodal(
   }
   fout.write(buf.data(), buf.size());
   fout.close();
-
-  if (!FLAGS_etdump_path.empty()) {
-    runner.write_etdump(FLAGS_etdump_path);
-  }
 }
 #endif
 
@@ -302,16 +285,13 @@ void run_xnnpack_backend(
 
   UnifiedRunConfig config;
   config.frame_dir = frame_dir;
-  config.frame_count = FLAGS_frame_count >= 0 ? FLAGS_frame_count : 1;
+  config.frame_count = FLAGS_frame_count > 0 ? FLAGS_frame_count : 1;
   config.questions = prompts.empty() ? "Describe this image." : prompts[0];
   for (size_t i = 1; i < prompts.size(); ++i) {
     config.questions += ";" + prompts[i];
   }
   config.seq_len = FLAGS_seq_len;
-  config.max_new_tokens = FLAGS_max_new_tokens;
   config.temperature = static_cast<float>(FLAGS_temperature);
-  config.lazy_kv_alloc = FLAGS_lazy_kv_alloc;
-  config.ignore_eos = FLAGS_ignore_eos;
   config.output_path = FLAGS_output_path;
 
   auto runner = create_xnnpack_backend_runner(manifest);
@@ -347,12 +327,9 @@ int main(int argc, char** argv) {
 
   if (FLAGS_backend == "xnnpack") {
     std::string image_path = FLAGS_image_path;
-    if (image_path.empty() && FLAGS_frame_count != 0) {
+    if (image_path.empty()) {
       ET_LOG(Error, "--image_path required for XNNPACK (preprocessed .bin)");
       return 1;
-    }
-    if (image_path.empty()) {
-      image_path = ".";
     }
     run_xnnpack_backend(
         FLAGS_encoder_path,
@@ -366,15 +343,15 @@ int main(int argc, char** argv) {
 
 #ifdef FOUNDATION_ENABLE_QNN
   if (FLAGS_backend == "qnn") {
-    if (FLAGS_image_path.empty() && FLAGS_frame_count != 0) {
+    if (FLAGS_image_path.empty()) {
       ET_LOG(Error, "--image_path required for QNN (preprocessed .bin)");
       return 1;
     }
 
     const int frame_count =
-        FLAGS_frame_count >= 0 ? FLAGS_frame_count : 1;
+        FLAGS_frame_count > 0 ? FLAGS_frame_count : 1;
 
-    if (frame_count != 1) {
+    if (frame_count > 1) {
       std::string frame_dir = FLAGS_image_path;
       if (frame_dir != "." && !std::filesystem::is_directory(frame_dir)) {
         std::filesystem::path p(FLAGS_image_path);
@@ -400,14 +377,9 @@ int main(int argc, char** argv) {
         config.questions += ";" + prompts[i];
       }
       config.seq_len = FLAGS_seq_len;
-      config.max_new_tokens = FLAGS_max_new_tokens;
       config.temperature = static_cast<float>(FLAGS_temperature);
       config.eval_mode = FLAGS_eval_mode;
-      config.lazy_kv_alloc = FLAGS_lazy_kv_alloc;
-      config.ignore_eos = FLAGS_ignore_eos;
       config.output_path = FLAGS_output_path;
-      config.proc_path = FLAGS_proc_path;
-      config.etdump_path = FLAGS_etdump_path;
 
       auto runner =
           executorch::examples::foundation::create_qnn_backend_runner(manifest);
@@ -427,14 +399,9 @@ int main(int argc, char** argv) {
     auto embedding = std::make_unique<executorch::extension::Module>(
         FLAGS_embedding_path.c_str(),
         executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
-    std::unique_ptr<executorch::runtime::EventTracer> event_tracer = nullptr;
-    if (!FLAGS_etdump_path.empty()) {
-      event_tracer = std::make_unique<executorch::etdump::ETDumpGen>();
-    }
     auto module = std::make_unique<executorch::extension::Module>(
         FLAGS_decoder_path.c_str(),
-        executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors,
-        std::move(event_tracer));
+        executorch::extension::Module::LoadMode::MmapUseMlockIgnoreErrors);
 
     example::KvBitWidth kv_bitwidth = example::KvBitWidth::kWidth8;
     if (module->method_names()->count("get_kv_io_bit_width") > 0) {

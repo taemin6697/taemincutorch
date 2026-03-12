@@ -20,6 +20,9 @@
 #include <executorch/runtime/core/exec_aten/util/scalar_type_util.h>
 #include <executorch/runtime/platform/log.h>
 #include <pytorch/tokenizers/hf_tokenizer.h>
+#ifdef ET_EVENT_TRACER_ENABLED
+#include <executorch/devtools/etdump/etdump_flatcc.h>
+#endif
 #include <pytorch/tokenizers/llama2c_tokenizer.h>
 #include <algorithm>
 #include <fstream>
@@ -453,7 +456,7 @@ Error MultimodalRunner<T>::load() {
         &stats_);
   }
 
-  buffer_manager_ = std::make_unique<ClientMem>();
+  buffer_manager_ = std::make_unique<ClientMem>(lazy_kv_alloc_);
   if (shared_buffer_) {
     buffer_manager_ = std::make_unique<RpcMem>(
         kv_manager_->total_cache_size_in_bytes(),
@@ -560,6 +563,14 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
   }
   int num_prompt_tokens = prompt_tokens.size();
   ET_CHECK_MSG(num_prompt_tokens >= 1, "Expected at least 1 prompt token");
+  // When max_new_tokens is set: effective = min(max_new_tokens, seq_len - prefill_tokens)
+  // (모델 컴파일 seq_len을 넘을 수 없으므로 남은 공간만 생성 가능)
+  if (config.max_new_tokens >= 0) {
+    const int32_t remaining = seq_len - cur_pos_ - num_prompt_tokens;
+    const int32_t effective_max_new =
+        (remaining < config.max_new_tokens) ? remaining : config.max_new_tokens;
+    seq_len = cur_pos_ + num_prompt_tokens + effective_max_new;
+  }
   ET_CHECK_MSG(
       cur_pos_ + num_prompt_tokens < seq_len,
       "sequence length exceeded - please increase the seq_len value");
@@ -616,6 +627,9 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
   prompt_tokens.push_back(cur_token);
 
   // Requant kv cache for prefill decode I/O
+  // no_lazy: full cache (context_len_-1)*num_heads*head_dim
+  // lazy: prefill portion only (cur_pos_*num_heads*head_dim) to avoid committing
+  //       all mmap pages; decode will touch the rest as it writes new tokens.
   if (eval_mode_ == EvalMode::kLookaheadDecoding ||
       eval_mode_ == EvalMode::kHybrid) {
     int64_t num_heads = prompt_processor_->get_num_heads();
@@ -625,7 +639,9 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
     std::vector<KVCache<T>> v_cache_ptrs = kv_manager_->get_v_cache_();
 
     const int64_t num_elems_per_layer =
-        (context_len_ - 1) * num_heads * head_dim;
+        lazy_kv_alloc_
+            ? cur_pos_ * num_heads * head_dim
+            : (context_len_ - 1) * num_heads * head_dim;
     // Requant kv cache from prefill output scale/zero_point to decode input
     // scale/zero_point
     for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
@@ -731,19 +747,19 @@ void MultimodalRunner<T>::merge_multimodal_embeddings(
       text_embeddings.data,
       total_elements * sizeof(float));
 
-  // Then replace placeholder positions with image hidden states
-  auto* image_data = image_hidden_states_->const_data_ptr<float>();
-  auto* merged_data = multimodal_embeddings_buffer_.data();
+  // Then replace placeholder positions with image hidden states (text-only: skip)
+  if (image_hidden_states_ && !placeholder_positions.empty()) {
+    auto* image_data = image_hidden_states_->const_data_ptr<float>();
+    auto* merged_data = multimodal_embeddings_buffer_.data();
 
-  int64_t image_seq_len = image_hidden_states_->size(1);
-
-  // Copy image hidden states to placeholder positions
-  for (int32_t i = 0; i < placeholder_positions.size(); ++i) {
-    int32_t pos = placeholder_positions[i];
-    std::memcpy(
-        merged_data + pos * embedding_dim,
-        image_data + i * embedding_dim,
-        embedding_dim * sizeof(float));
+    // Copy image hidden states to placeholder positions
+    for (int32_t i = 0; i < placeholder_positions.size(); ++i) {
+      int32_t pos = placeholder_positions[i];
+      std::memcpy(
+          merged_data + pos * embedding_dim,
+          image_data + i * embedding_dim,
+          embedding_dim * sizeof(float));
+    }
   }
 
   merged_embeddings_.data = multimodal_embeddings_buffer_.data();
@@ -788,8 +804,12 @@ Error MultimodalRunner<T>::finalize_prefill() {
   std::vector<KVCache<T>> k_cache_ptrs = kv_manager_->get_k_cache_();
   std::vector<KVCache<T>> v_cache_ptrs = kv_manager_->get_v_cache_();
 
+  // no_lazy: full cache. lazy: prefill portion only (cur_pos_) to preserve
+  // lazy mmap; decode will touch the rest as it writes.
   const int64_t num_elems_per_layer =
-      (context_len_ - 1) * num_heads * head_dim;
+      lazy_kv_alloc_
+          ? cur_pos_ * num_heads * head_dim
+          : (context_len_ - 1) * num_heads * head_dim;
 
   for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
     T* k_cache_data = k_cache_ptrs[layer_idx].buffer;
@@ -982,6 +1002,34 @@ MultimodalRunner<T>::get_decoder_model_version() {
     stats_.model_load_end_ms = time_in_ms();
   }
   return decoder_model_version_;
+}
+
+template <typename T>
+void MultimodalRunner<T>::write_etdump(const std::string& path) const {
+  if (path.empty()) {
+    return;
+  }
+#ifdef ET_EVENT_TRACER_ENABLED
+  auto* tracer = module_->event_tracer();
+  auto* etdump_gen = dynamic_cast<executorch::etdump::ETDumpGen*>(tracer);
+  if (etdump_gen == nullptr) {
+    return;
+  }
+  executorch::etdump::ETDumpResult result = etdump_gen->get_etdump_data();
+  if (result.buf != nullptr && result.size > 0) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (f) {
+      fwrite(result.buf, 1, result.size, f);
+      fclose(f);
+      ET_LOG(Info, "Wrote etdump to %s, size=%zu", path.c_str(), result.size);
+    } else {
+      ET_LOG(Error, "Failed to open etdump file: %s", path.c_str());
+    }
+    free(result.buf);
+  }
+#else
+  (void)path;
+#endif
 }
 
 // Explicit instantiations

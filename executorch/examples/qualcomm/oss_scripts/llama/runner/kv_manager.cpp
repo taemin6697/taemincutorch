@@ -187,6 +187,25 @@ void KVManager<T>::init_cache(IMemAlloc* buffer_manager, int32_t ar_len) {
 }
 
 template <typename T>
+size_t KVManager<T>::resident_cache_size_in_bytes(
+    const IMemAlloc& buffer_manager) const {
+  const size_t cache_in_bytes = metadata_.num_heads * metadata_.head_dim *
+      metadata_.max_cache_len * sizeof(T);
+  const size_t cache_out_bytes = metadata_.num_heads * metadata_.head_dim *
+      metadata_.max_ar_len * sizeof(T);
+  size_t total = 0;
+  for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+    total += buffer_manager.resident_bytes(k_cache_[layer].buffer, cache_in_bytes);
+    total +=
+        buffer_manager.resident_bytes(k_cache_[layer].output_buffer, cache_out_bytes);
+    total += buffer_manager.resident_bytes(v_cache_[layer].buffer, cache_in_bytes);
+    total +=
+        buffer_manager.resident_bytes(v_cache_[layer].output_buffer, cache_out_bytes);
+  }
+  return total;
+}
+
+template <typename T>
 void KVManager<T>::rearrange_cache(int32_t ar_len_dst) {
   // Don't need to rearrange if cur_ar_len_ is equal to target ar_len
   if (cur_ar_len_ == ar_len_dst)

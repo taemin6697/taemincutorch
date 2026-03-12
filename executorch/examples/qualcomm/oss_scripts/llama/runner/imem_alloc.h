@@ -24,6 +24,11 @@ class IMemAlloc {
       void* data_ptr,
       size_t data_size,
       executorch::runtime::TensorInfo tensor_info) = 0;
+  virtual size_t resident_bytes(const void* data_ptr, size_t data_size) const {
+    (void)data_ptr;
+    (void)data_size;
+    return 0;
+  }
 };
 
 } // namespace example

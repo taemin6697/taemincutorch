@@ -9,7 +9,9 @@
 #pragma once
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/imem_alloc.h>
+#include <cstdint>
 #include <sys/mman.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -92,6 +94,43 @@ class ClientMem final : public IMemAlloc {
       void* data_ptr,
       size_t data_size,
       executorch::runtime::TensorInfo tensor_info) override {};
+
+  size_t resident_bytes(const void* data_ptr, size_t data_size) const override {
+    if (!lazy_ || data_ptr == nullptr || data_size == 0) {
+      return data_size;
+    }
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+      return 0;
+    }
+
+    const uintptr_t start = reinterpret_cast<uintptr_t>(data_ptr);
+    const uintptr_t aligned_start = start & ~static_cast<uintptr_t>(page_size - 1);
+    const uintptr_t end = start + data_size;
+    const uintptr_t aligned_end =
+        (end + static_cast<uintptr_t>(page_size - 1)) &
+        ~static_cast<uintptr_t>(page_size - 1);
+    const size_t length = aligned_end - aligned_start;
+    const size_t page_count = length / static_cast<size_t>(page_size);
+    if (page_count == 0) {
+      return 0;
+    }
+
+    std::vector<unsigned char> residency(page_count, 0);
+    if (mincore(
+            reinterpret_cast<void*>(aligned_start),
+            length,
+            residency.data()) != 0) {
+      return 0;
+    }
+
+    size_t resident_pages = 0;
+    for (unsigned char value : residency) {
+      resident_pages += static_cast<size_t>(value & 1U);
+    }
+    return resident_pages * static_cast<size_t>(page_size);
+  }
 
  private:
   bool lazy_;

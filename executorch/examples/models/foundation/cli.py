@@ -47,6 +47,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         questions=args.questions,
         timestamps=args.timestamps,
         seq_len=args.seq_len,
+        max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         decode_after_frames=args.decode_after_frames,
         eval_mode=eval_mode,
@@ -156,6 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--timestamps", nargs="+", type=float, default=None)
     run_parser.add_argument("--seq_len", type=int, default=None)
+    run_parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=None,
+        help="최대 생성 토큰 수. 지정 시 seq_len보다 우선. 예: --max_new_tokens 100",
+    )
     run_parser.add_argument("--temperature", type=float, default=None)
     run_parser.add_argument(
         "--eval_mode",

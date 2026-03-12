@@ -175,6 +175,8 @@ class KVManager {
     return total_cache_size_;
   }
 
+  size_t resident_cache_size_in_bytes(const IMemAlloc& buffer_manager) const;
+
   int64_t get_head_dim() const {
     return metadata_.head_dim;
   }

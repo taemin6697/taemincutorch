@@ -45,16 +45,18 @@ def _save_log_dir(
     eval_mode: int,
     stream: bool,
     lazy_kv_alloc: bool,
+    ignore_eos: bool = False,
 ) -> Path:
     input_type = "video" if video else ("image" if image else "text")
     run_type = "stream" if stream else "batch"
     fps_tag = "1p0"
     lazy_tag = "lazy" if lazy_kv_alloc else "nolazy"
+    ignore_eos_tag = "ignore_eos" if ignore_eos else "noignoreeos"
     if manifest.variant.startswith(f"{manifest.model_family}_"):
         model_tag = manifest.variant
     else:
         model_tag = f"{manifest.model_family}_{manifest.variant}"
-    seq_tag = f"seq{seq_len or manifest.export.get('max_seq_len', 1024)}"
+    seq_tag = f"seq{seq_len or manifest.export.get('max_seq_len') or manifest.export.get('max_context_len') or 1024}"
     frame_tag = f"frames{frame_count}"
     folder_name = "_".join(
         [
@@ -67,6 +69,7 @@ def _save_log_dir(
             frame_tag,
             f"eval{eval_mode}",
             lazy_tag,
+            ignore_eos_tag,
         ]
     )
     safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in folder_name)
@@ -145,7 +148,8 @@ def _init_memory_timeline(path: Path) -> None:
         "elapsed_s,phase,pid_alive,dumpsys_total_pss_kb,dumpsys_total_rss_kb,"
         "dumpsys_total_swap_kb,smaps_rss_kb,smaps_pss_kb,smaps_private_dirty_kb,"
         "smaps_shared_clean_kb,mem_available_kb,cached_kb,dma_heap_pool_kb,"
-        "gpu_total_kb,kgsl_shmem_usage_kb\n",
+        "gpu_total_kb,kgsl_shmem_usage_kb,self_rss_kb,kv_physical_committed_kb,"
+        "kv_total_kb\n",
     )
 
 
@@ -175,9 +179,53 @@ def _append_memory_timeline_sample(
         str(_extract_named_kb_value(meminfo, "DmaHeapPool") or ""),
         str(_extract_named_kb_value(meminfo, "GpuTotal") or ""),
         str(_extract_named_kb_value(meminfo, "KgslShmemUsage") or ""),
+        "",  # self_rss_kb (ADB는 프로세스 내부 아님)
+        "",  # kv_physical_committed_kb
+        "",  # kv_total_kb
     ]
     with timeline_path.open("a", encoding="utf-8") as f:
         f.write(",".join(row) + "\n")
+
+
+def _merge_memory_timeline(
+    launcher_timeline_path: Path,
+    runner_timeline_path: Path,
+    output_path: Path,
+) -> None:
+    """prelaunch(launcher) + runner + postrun(launcher) 병합. runner 시작 -2초 ~ 종료 +2초."""
+    import csv
+
+    launcher_rows: list[dict[str, str]] = []
+    with launcher_timeline_path.open(encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        for row in reader:
+            launcher_rows.append(row)
+
+    prelaunch = [r for r in launcher_rows if float(r.get("elapsed_s", 0)) < 0]
+    postrun = [r for r in launcher_rows if (r.get("phase") or "").strip() == "postrun"]
+
+    runner_rows: list[dict[str, str]] = []
+    if runner_timeline_path.exists():
+        with runner_timeline_path.open(encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or fieldnames
+            for row in reader:
+                runner_rows.append(row)
+
+    # runner 없으면 launcher running 사용
+    running = (
+        runner_rows
+        if runner_rows
+        else [r for r in launcher_rows if (r.get("phase") or "").strip() == "running"]
+    )
+    merged = prelaunch + running + postrun
+    if not merged:
+        return
+    with output_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(merged)
 
 
 def _capture_prelaunch_timeline(
@@ -217,7 +265,7 @@ def _start_remote_runner(
 ) -> int:
     remote_launch = (
         f"cd {shlex.quote(remote_root)} && "
-        "rm -f foundation_output.txt foundation_proc.csv runner_stdout.txt runner.pid && "
+        "rm -f foundation_output.txt foundation_proc.csv android_memory_timeline.csv runner_stdout.txt runner.pid && "
         "if command -v nohup >/dev/null 2>&1; then "
         f"  nohup sh -c {shlex.quote(runner_cmd)} > runner_stdout.txt 2>&1 < /dev/null & "
         "else "
@@ -240,7 +288,7 @@ def _wait_for_process_exit(
     *,
     poll_interval_s: float = 0.02,
     detailed_interval_s: float = 0.5,
-    postrun_window_s: float = 3.0,
+    postrun_window_s: float = 2.0,
 ) -> bool:
     live_snapshot_taken = False
     started_at = time.monotonic()
@@ -302,7 +350,8 @@ def _run_unified_xnnpack(
     questions: list[str],
     timestamps: list[float] | None,
     seq_len: int | None,
-    temperature: float | None,
+    max_new_tokens: int | None = None,
+    temperature: float | None = None,
     decode_after_frames: int | None = None,
     eval_mode: int = 0,
     lazy_kv_alloc: bool = False,
@@ -323,6 +372,7 @@ def _run_unified_xnnpack(
     remote_frames = f"{remote_root}/frames"
     remote_runner = f"{remote_root}/xnnpack_qnn_runner"
     remote_output = f"{remote_root}/foundation_output.txt"
+    remote_timeline = f"{remote_root}/android_memory_timeline.csv"
 
     with tempfile.TemporaryDirectory(prefix="foundation_xnnpack_") as tmpdir:
         tmpdir = Path(tmpdir)
@@ -340,7 +390,7 @@ def _run_unified_xnnpack(
                 max_frames=decode_after_frames,
             )
         else:
-            raise SystemExit("XNNPACK unified run requires --image or --video")
+            frame_count = 0
 
         out_dir = (
             _save_log_dir(
@@ -352,6 +402,7 @@ def _run_unified_xnnpack(
                 eval_mode=eval_mode,
                 stream=stream,
                 lazy_kv_alloc=lazy_kv_alloc,
+                ignore_eos=ignore_eos,
             )
             if save_log
             else Path.cwd()
@@ -407,11 +458,13 @@ def _run_unified_xnnpack(
             f"--tokenizer_path={tokenizer_path}",
             f"--image_path={remote_frames}",
             f"--frame_count={frame_count}",
-            f"--seq_len={seq_len or 128}",
+            f"--seq_len={seq_len or manifest.export.get('max_seq_len') or manifest.export.get('max_context_len') or 1024}",
             f"--temperature={temperature if temperature is not None else 0.0}",
             f"--eval_mode={eval_mode}",
             f"--output_path=foundation_output.txt",
         ]
+        if max_new_tokens is not None and max_new_tokens >= 0:
+            args.append(f"--max_new_tokens={max_new_tokens}")
         if ignore_eos:
             args.append("--ignore_eos")
         for q in questions:
@@ -432,6 +485,9 @@ def _run_unified_xnnpack(
             print(runner_stdout)
         _run(adb + ["pull", remote_output, str(local_output)])
         rc = _run(adb + ["pull", remote_proc, str(local_proc)])
+        runner_timeline = out_dir / "android_memory_timeline_runner.csv"
+        _run_capture(adb + ["pull", remote_timeline, str(runner_timeline)], check=False)
+        _merge_memory_timeline(local_timeline, runner_timeline, local_timeline)
         if save_log:
             generate_memory_timeline_plot(out_dir)
         return rc
@@ -450,7 +506,8 @@ def _run_unified_qnn(
     questions: list[str],
     timestamps: list[float] | None,
     seq_len: int | None,
-    temperature: float | None,
+    max_new_tokens: int | None = None,
+    temperature: float | None = None,
     decode_after_frames: int | None = None,
     eval_mode: int = 0,
     lazy_kv_alloc: bool = False,
@@ -499,6 +556,7 @@ def _run_unified_qnn(
                 eval_mode=eval_mode,
                 stream=stream,
                 lazy_kv_alloc=lazy_kv_alloc,
+                ignore_eos=ignore_eos,
             )
             if save_log
             else Path.cwd()
@@ -551,12 +609,13 @@ def _run_unified_qnn(
         elif frame_count > 0:
             image_path = "frame_0000.bin"
         else:
-            image_path = ""
-        if not image_path:
-            raise SystemExit("QNN foundation 실행에는 --image 또는 --video 가 필요합니다.")
+            image_path = "."
+        # frame_count=0: text-only mode (--image/--video 없이 --questions만)
 
         device_output = f"{ADBRunner.DEVICE_WORKSPACE}/foundation_output.txt"
         device_proc = f"{ADBRunner.DEVICE_WORKSPACE}/foundation_proc.csv"
+        device_timeline = f"{ADBRunner.DEVICE_WORKSPACE}/android_memory_timeline.csv"
+        device_etdump = f"{ADBRunner.DEVICE_WORKSPACE}/foundation_qnn_profiling.etdp"
         cmd = [
             "chmod +x ./xnnpack_qnn_runner &&",
             "export LD_LIBRARY_PATH=. &&",
@@ -568,12 +627,17 @@ def _run_unified_qnn(
             f"--tokenizer_path={tokenizer_path}",
             f"--image_path={image_path}",
             f"--frame_count={frame_count}",
-            f"--seq_len={seq_len or manifest.export.get('max_seq_len', 1024)}",
+            f"--seq_len={seq_len or manifest.export.get('max_seq_len') or manifest.export.get('max_context_len') or 1024}",
             f"--temperature={temperature if temperature is not None else 0.0}",
             f"--eval_mode={eval_mode}",
             f"--{'lazy_kv_alloc' if lazy_kv_alloc else 'nolazy_kv_alloc'}",
-            "--output_path=foundation_output.txt",
+            f"--output_path={ADBRunner.DEVICE_WORKSPACE}/foundation_output.txt",
+            f"--proc_path={ADBRunner.DEVICE_WORKSPACE}/foundation_proc.csv",
         ]
+        if max_new_tokens is not None and max_new_tokens >= 0:
+            cmd.append(f"--max_new_tokens={max_new_tokens}")
+        if save_log:
+            cmd.append("--etdump_path=foundation_qnn_profiling.etdp")
         if ignore_eos:
             cmd.append("--ignore_eos")
         for q in questions:
@@ -598,7 +662,18 @@ def _run_unified_qnn(
         try:
             _run(["adb", "-s", device, "pull", device_output, str(local_output)])
             rc = _run(["adb", "-s", device, "pull", device_proc, str(local_proc)])
+            runner_timeline = out_dir / "android_memory_timeline_runner.csv"
+            _run_capture(
+                ["adb", "-s", device, "pull", device_timeline, str(runner_timeline)],
+                check=False,
+            )
+            _merge_memory_timeline(local_timeline, runner_timeline, local_timeline)
             if save_log:
+                local_etdump = out_dir / "foundation_qnn_profiling.etdp"
+                _run_capture(
+                    ["adb", "-s", device, "pull", device_etdump, str(local_etdump)],
+                    check=False,
+                )
                 generate_memory_timeline_plot(out_dir)
             return rc
         except subprocess.CalledProcessError:
@@ -620,6 +695,7 @@ def run_with_manifest(
     questions: list[str] | None = None,
     timestamps: list[float] | None = None,
     seq_len: int | None = None,
+    max_new_tokens: int | None = None,
     temperature: float | None = None,
     decode_after_frames: int | None = None,
     eval_mode: int = 0,
@@ -654,6 +730,7 @@ def run_with_manifest(
             questions=questions,
             timestamps=timestamps,
             seq_len=seq_len,
+            max_new_tokens=max_new_tokens,
             temperature=temperature,
             decode_after_frames=decode_after_frames,
             eval_mode=eval_mode,
@@ -678,6 +755,7 @@ def run_with_manifest(
             questions=questions,
             timestamps=timestamps,
             seq_len=seq_len,
+            max_new_tokens=max_new_tokens,
             temperature=temperature,
             decode_after_frames=decode_after_frames,
             eval_mode=eval_mode,

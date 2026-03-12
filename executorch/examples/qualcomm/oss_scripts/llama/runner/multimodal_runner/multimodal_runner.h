@@ -149,6 +149,12 @@ class MultimodalRunner : public executorch::extension::llm::IRunner {
   size_t get_kv_cache_total_bytes() const {
     return kv_manager_ ? kv_manager_->total_cache_size_in_bytes() : 0;
   }
+  /** Actually resident KV cache bytes currently committed in process memory. */
+  size_t get_kv_cache_resident_bytes() const {
+    return kv_manager_ && buffer_manager_
+        ? kv_manager_->resident_cache_size_in_bytes(*buffer_manager_)
+        : 0;
+  }
   /** Modality placeholder token id exposed for the streaming runner. */
   uint64_t get_placeholder_token_id();
 
@@ -173,6 +179,12 @@ class MultimodalRunner : public executorch::extension::llm::IRunner {
       std::function<void(const char* phase, long start_ms, long end_ms)> cb) {
     load_phase_cb_ = std::move(cb);
   }
+
+  /**
+   * Write QNN/ExecuTorch profiling etdump to file if EventTracer is ETDumpGen.
+   * No-op if path empty or event tracer not available.
+   */
+  void write_etdump(const std::string& path) const;
 
  private:
   enum EvalMode {

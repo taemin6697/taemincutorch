@@ -144,7 +144,8 @@ if(TARGET qnn_executorch_backend)
     extension_module
     extension_tensor
     custom_ops
-    tokenizers::tokenizers)
+    tokenizers::tokenizers
+    etdump)
   if(TARGET quantized_ops_lib)
     target_link_libraries(xnnpack_qnn_runner PUBLIC quantized_ops_lib quantized_kernels)
   endif()

@@ -40,16 +40,11 @@ struct UnifiedRunConfig {
   std::string questions;
   std::string query_timestamps;
   int seq_len{128};
-  int max_new_tokens{-1};  // -1: use seq_len. >0: max tokens to generate
   double temperature{0.0};
   int eval_mode{0};
-  bool lazy_kv_alloc{false};
-  bool ignore_eos{false};
   bool stream{false};
   bool save_log{false};
   std::string output_path;
-  std::string proc_path;  // foundation_proc.csv. empty = use cwd/foundation_proc.csv
-  std::string etdump_path;
 };
 
 class BackendRunner {

@@ -324,7 +324,7 @@ cd /workspace/stream/executorch
 ```bash
 cd /workspace/stream
 
-CMAKE_PREFIX="${PWD}/executorch/build-android;${PWD}/executorch/build-android/third-party/gflags"
+CMAKE_PREFIX="${PWD}/executorch/build-android;${PWD}/executorch/build-android/third-party/gflags;${PWD}/executorch/build-android/lib/cmake"
 cmake -S executorch/examples/models/foundation \
   -B executorch/build-android/foundation \
   -DCMAKE_BUILD_TYPE=Release \
@@ -332,11 +332,15 @@ cmake -S executorch/examples/models/foundation \
   -DANDROID_ABI=arm64-v8a \
   -DANDROID_PLATFORM=android-30 \
   -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX" \
+  -DCMAKE_FIND_ROOT_PATH="${PWD}/executorch/build-android;${CMAKE_FIND_ROOT_PATH}" \
   -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
-  -Dgflags_DIR="${PWD}/executorch/build-android/third-party/gflags"
+  -Dgflags_DIR="${PWD}/executorch/build-android/third-party/gflags" \
+  -Wno-dev
 
 cmake --build executorch/build-android/foundation -j16
 ```
+
+> `CMAKE_PREFIX_PATH`에 `lib/cmake`를 포함해야 executorch, tokenizers 패키지를 찾을 수 있습니다.
 
 QNN runner 바이너리 경로:
 
@@ -373,6 +377,23 @@ python -m executorch.examples.models.foundation.cli run ...
 `android_memory_timeline.csv` 는 `0초=runner start` 기준이며, 약 `-2초 ~ 종료` 구간을 `0.1초` 간격으로 기록합니다.
 같은 폴더에 `memory_timeline_plot.png` 도 자동 생성됩니다.
 
+
+텍스트 입력 예시 (이미지/비디오 없이 `--questions`만 사용):
+
+```bash
+cd /workspace/stream
+
+python -m executorch.examples.models.foundation.cli run \
+  --manifest /workspace/stream/my_save/save_model/cpu/internvl3_xnnpack_1b_2k/manifest.json \
+  --runner_binary /workspace/stream/executorch/build-android-xnnpack/foundation/xnnpack_qnn_runner \
+  --device R3KYC01FW1P \
+  --questions "What is the capital of France? Answer in one sentence." \
+  --temperature 0.0 \
+  --save_log
+```
+
+이미지 입력 예시
+
 ```bash
 cd /workspace/stream
 
@@ -386,21 +407,22 @@ python -m executorch.examples.models.foundation.cli run \
   --save_log
 ```
 
-비디오 입력을 쓸 때는 `--image` 대신 `--video` 를 사용합니다.
+비디오 입력 예시
 
 ```bash
 cd /workspace/stream
 
 python -m executorch.examples.models.foundation.cli run \
-  --manifest /workspace/stream/my_save/save_model/cpu/internvl3_xnnpack_1b_1k/manifest.json \
+  --manifest /workspace/stream/my_save/save_model/cpu/internvl3_xnnpack_2b_2k/manifest.json \
   --runner_binary /workspace/stream/executorch/build-android-xnnpack/foundation/xnnpack_qnn_runner \
   --device R3KYC01FW1P \
   --video /workspace/stream/my_save/sample_video/sample.mp4 \
   --questions "Describe this video briefly using around 10 words." \
   --temperature 0.0 \
-  --decode_after_frames 3 \
+  --decode_after_frames 1 \
   --save_log \
-  --ignore_eos
+  --ignore_eos \
+  --seq_len 1600
 ```
 
 > 현재 foundation XNNPACK 경로에서는 `--lazy_kv_alloc` 가 QNN처럼 실제 KV 물리 할당 전략을 바꾸지는 않습니다.  
@@ -429,13 +451,36 @@ QNN은 추가로 build path, device serial, model 이름이 필요합니다.
 `android_memory_timeline.csv` 는 `0초=runner start` 기준이며, 약 `-2초 ~ 종료` 구간을 `0.1초` 간격으로 기록합니다.
 같은 폴더에 `memory_timeline_plot.png` 도 자동 생성됩니다.
 
+텍스트 입력 예시 (이미지/비디오 없이 `--questions`만 사용):
+
 ```bash
 export QNN_SDK_ROOT=/path/to/qnn_sdk
 
 cd /workspace/stream
 
 python -m executorch.examples.models.foundation.cli run \
-  --manifest /workspace/stream/my_save/save_model/qnn/internvl3_hybrid_16p_2k/manifest.json \
+  --manifest /workspace/stream/my_save/save_model/qnn/internvl3_2b_hybrid_16p_2k/manifest.json \
+  --runner_binary /workspace/stream/executorch/build-android/foundation/xnnpack_qnn_runner \
+  -b executorch/build-android \
+  -s R3KYC01FW1P \
+  -m SM8750 \
+  --questions "What is the capital of France? Answer in one sentence." \
+  --temperature 0.0 \
+  --save_log \
+  --lazy_kv_alloc \
+  --ignore_eos \
+  --max_new_tokens 128
+```
+
+이미지 입력 예시:
+
+```bash
+export QNN_SDK_ROOT=/path/to/qnn_sdk
+
+cd /workspace/stream
+
+python -m executorch.examples.models.foundation.cli run \
+  --manifest /workspace/stream/my_save/save_model/qnn/internvl3_2b_hybrid_16p_2k/manifest.json \
   --runner_binary /workspace/stream/executorch/build-android/foundation/xnnpack_qnn_runner \
   -b executorch/build-android \
   -s R3KYC01FW1P \
@@ -454,7 +499,7 @@ export QNN_SDK_ROOT=/path/to/qnn_sdk
 cd /workspace/stream
 
 python -m executorch.examples.models.foundation.cli run \
-  --manifest /workspace/stream/my_save/save_model/qnn/internvl3_hybrid_16p_2k/manifest.json \
+  --manifest /workspace/stream/my_save/save_model/qnn/internvl3_2b_hybrid_16p_2k/manifest.json \
   --runner_binary /workspace/stream/executorch/build-android/foundation/xnnpack_qnn_runner \
   -b executorch/build-android \
   -s R3KYC01FW1P \
@@ -464,12 +509,15 @@ python -m executorch.examples.models.foundation.cli run \
   --temperature 0.0 \
   --decode_after_frames 3 \
   --save_log \
-  --lazy_kv_alloc \
-  --ignore_eos
+  --no-lazy_kv_alloc \
+  --ignore_eos \
+  --seq_len 1600
 ```
 
 - `--decode_after_frames N`: 비디오에서 첫 N프레임만 사용 후 질문 처리 (미지정 시 전체)
 - `--ignore_eos`: EOS/stop token이 나와도 멈추지 않고 `--seq_len` 한도까지 계속 생성
+- `--seq_len N`: 전체 시퀀스 길이 상한 (프롬프트+생성). 생성 가능 토큰 ≈ N - 프롬프트 토큰 수. 미지정 시 manifest의 max_seq_len/max_context_len 사용
+- `--max_new_tokens N`: 최대 생성 토큰 수. 지정 시 seq_len보다 우선. 예: `--max_new_tokens 100` (모델 컴파일 길이 2048이어도 100토큰만 생성)
 - `--save_log`: `my_save/save_log/cpu/<파라미터폴더>/` 또는 `my_save/save_log/qnn/<파라미터폴더>/` 아래에 `foundation_output.txt`, `foundation_proc.csv` 저장
 - 기본값: `--no-lazy_kv_alloc`
 - `--lazy_kv_alloc`: QNN에서 KV cache를 `mmap+MAP_NORESERVE`로 lazy 물리 할당
@@ -524,9 +572,9 @@ runner는 Android용 바이너리이므로 디바이스에 push 후 `adb shell` 
 - `--embedding_path=...`
 - `--decoder_path=...`
 - `--tokenizer_path=...`
-- `--image_path=...` (전처리된 .bin 또는 frame 디렉터리)
+- `--image_path=...` (전처리된 .bin 또는 frame 디렉터리, 텍스트 전용 모드에서는 `--frame_count=0` 시 생략 가능)
 - `--prompt=...` (여러 개 가능)
-- `--seq_len=128`
+- `--seq_len=128` (전체 시퀀스 상한, 생성 토큰 수 아님)
 - `--temperature=0.0`
 - `--ignore_eos` (EOS/stop token 무시 후 `--seq_len`까지 계속 생성)
 - `--lazy_kv_alloc` (QNN만 실제 의미 있음, 미지정 시 기본은 `--no-lazy_kv_alloc`)
