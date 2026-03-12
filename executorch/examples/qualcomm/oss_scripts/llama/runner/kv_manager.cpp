@@ -8,6 +8,7 @@
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
 #include <executorch/runtime/platform/assert.h>
+#include <algorithm>
 namespace example {
 template <typename T>
 KVManager<T>::KVManager(Metadata metadata) : metadata_(metadata) {
@@ -206,24 +207,33 @@ size_t KVManager<T>::resident_cache_size_in_bytes(
 }
 
 template <typename T>
-void KVManager<T>::rearrange_cache(int32_t ar_len_dst) {
+void KVManager<T>::rearrange_cache(int32_t ar_len_dst, int32_t max_pos_for_lazy) {
   // Don't need to rearrange if cur_ar_len_ is equal to target ar_len
   if (cur_ar_len_ == ar_len_dst)
     return;
   for (int layer = 0; layer < metadata_.num_layers; ++layer) {
-    rearrange_key(k_cache_[layer], ar_len_dst);
-    rearrange_value(v_cache_[layer], ar_len_dst);
+    rearrange_key(k_cache_[layer], ar_len_dst, max_pos_for_lazy);
+    rearrange_value(v_cache_[layer], ar_len_dst, max_pos_for_lazy);
   }
   // rearrange done.
   cur_ar_len_ = ar_len_dst;
 }
 
 template <typename T>
-void KVManager<T>::rearrange_key(KVCache<T>& k_cache, int32_t ar_len_dst) {
+void KVManager<T>::rearrange_key(
+    KVCache<T>& k_cache,
+    int32_t ar_len_dst,
+    int32_t max_pos_for_lazy) {
   const int32_t src_cache_num = (cur_ar_len_ == metadata_.context_len)
       ? metadata_.context_len
       : metadata_.context_len - cur_ar_len_;
   const int32_t dst_cache_num = metadata_.context_len - ar_len_dst;
+  const int32_t copy_num = (max_pos_for_lazy > 0)
+      ? std::min(dst_cache_num, max_pos_for_lazy)
+      : dst_cache_num;
+  if (copy_num <= 0)
+    return;
+
   T* k_cache_in_read_ptr = k_cache.buffer;
   T* k_cache_in_write_ptr = k_cache.buffer;
 
@@ -231,11 +241,16 @@ void KVManager<T>::rearrange_key(KVCache<T>& k_cache, int32_t ar_len_dst) {
     // copy from first dimension
     for (int i = 0; i < metadata_.head_dim * metadata_.num_heads; i++) {
       std::memmove(
-          k_cache_in_write_ptr, k_cache_in_read_ptr, dst_cache_num * sizeof(T));
+          k_cache_in_write_ptr, k_cache_in_read_ptr, copy_num * sizeof(T));
       k_cache_in_read_ptr += src_cache_num;
       k_cache_in_write_ptr += dst_cache_num;
     }
   } else {
+    const int32_t src_copy = (max_pos_for_lazy > 0)
+        ? std::min(src_cache_num, max_pos_for_lazy)
+        : src_cache_num;
+    if (src_copy <= 0)
+      return;
     k_cache_in_read_ptr +=
         (metadata_.head_dim * metadata_.num_heads - 1) * src_cache_num;
     k_cache_in_write_ptr +=
@@ -243,7 +258,7 @@ void KVManager<T>::rearrange_key(KVCache<T>& k_cache, int32_t ar_len_dst) {
     // copy from last dimension
     for (int i = 0; i < metadata_.head_dim * metadata_.num_heads; i++) {
       std::memmove(
-          k_cache_in_write_ptr, k_cache_in_read_ptr, src_cache_num * sizeof(T));
+          k_cache_in_write_ptr, k_cache_in_read_ptr, src_copy * sizeof(T));
       k_cache_in_read_ptr -= src_cache_num;
       k_cache_in_write_ptr -= dst_cache_num;
     }
@@ -251,11 +266,21 @@ void KVManager<T>::rearrange_key(KVCache<T>& k_cache, int32_t ar_len_dst) {
 }
 
 template <typename T>
-void KVManager<T>::rearrange_value(KVCache<T>& v_cache, int32_t ar_len_dst) {
+void KVManager<T>::rearrange_value(
+    KVCache<T>& v_cache,
+    int32_t ar_len_dst,
+    int32_t max_pos_for_lazy) {
   const int32_t src_cache_num = (cur_ar_len_ == metadata_.context_len)
       ? metadata_.context_len
       : metadata_.context_len - cur_ar_len_;
   const int32_t dst_cache_num = metadata_.context_len - ar_len_dst;
+  const int32_t copy_num = (max_pos_for_lazy > 0)
+      ? std::min(dst_cache_num, max_pos_for_lazy)
+      : dst_cache_num;
+  if (copy_num <= 0)
+    return;
+
+  const int32_t copy_bytes = copy_num * metadata_.head_dim * sizeof(T);
   T* v_cache_in_read_ptr = v_cache.buffer;
   T* v_cache_in_write_ptr = v_cache.buffer;
   if (src_cache_num > dst_cache_num) {
@@ -264,11 +289,17 @@ void KVManager<T>::rearrange_value(KVCache<T>& v_cache, int32_t ar_len_dst) {
       std::memmove(
           v_cache_in_write_ptr,
           v_cache_in_read_ptr,
-          dst_cache_num * metadata_.head_dim * sizeof(T));
+          copy_bytes);
       v_cache_in_read_ptr += src_cache_num * metadata_.head_dim;
       v_cache_in_write_ptr += dst_cache_num * metadata_.head_dim;
     }
   } else {
+    const int32_t src_copy = (max_pos_for_lazy > 0)
+        ? std::min(src_cache_num, max_pos_for_lazy)
+        : src_cache_num;
+    if (src_copy <= 0)
+      return;
+    const int32_t src_copy_bytes = src_copy * metadata_.head_dim * sizeof(T);
     v_cache_in_read_ptr +=
         metadata_.head_dim * (metadata_.num_heads - 1) * src_cache_num;
     v_cache_in_write_ptr +=
@@ -278,7 +309,7 @@ void KVManager<T>::rearrange_value(KVCache<T>& v_cache, int32_t ar_len_dst) {
       std::memmove(
           v_cache_in_write_ptr,
           v_cache_in_read_ptr,
-          src_cache_num * metadata_.head_dim * sizeof(T));
+          src_copy_bytes);
       v_cache_in_read_ptr -= src_cache_num * metadata_.head_dim;
       v_cache_in_write_ptr -= dst_cache_num * metadata_.head_dim;
     }

@@ -52,6 +52,7 @@ template <typename T>
 void MultimodalTokenGenerator<T>::init_io(
     IMemAlloc* buffer_manager,
     Result<MethodMeta> method_meta) {
+  this->buffer_manager_ = buffer_manager;
   size_t idx = 0;
   input_tensors_.reserve(method_meta->num_inputs());
   output_tensors_.reserve(method_meta->num_outputs());

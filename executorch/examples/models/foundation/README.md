@@ -469,7 +469,7 @@ python -m executorch.examples.models.foundation.cli run \
   --save_log \
   --lazy_kv_alloc \
   --ignore_eos \
-  --max_new_tokens 128
+  --max_new_tokens 512
 ```
 
 이미지 입력 예시:

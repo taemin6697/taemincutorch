@@ -36,7 +36,8 @@ class MultimodalPromptProcessor : public example::PromptProcessor<T> {
       DecoderRunner* decoder_runner,
       KVManager<T>* kv_manager,
       const std::string& method_name,
-      Metadata metadata);
+      Metadata metadata,
+      bool lazy_kv_alloc = false);
 
   int64_t get_num_heads() const {
     return metadata_.num_heads;
@@ -118,6 +119,8 @@ class MultimodalPromptProcessor : public example::PromptProcessor<T> {
 
   // metadata specific to multimodal
   Metadata metadata_;
+  bool lazy_kv_alloc_;
+  IMemAlloc* buffer_manager_{nullptr};
 
   // Additional input for multimodal
   TensorStruct<float> input_embedding_;

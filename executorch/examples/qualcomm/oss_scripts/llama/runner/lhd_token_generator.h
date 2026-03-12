@@ -102,7 +102,8 @@ class LhdTokenGenerator : public TokenGenerator<T> {
       bool dump_logits,
       AttentionSinkRopeRunner* attention_sink_rope_runner,
       typename TokenGenerator<T>::PerTokenTimingCallback per_token_timing_cb =
-          nullptr) override;
+          nullptr,
+      int32_t max_pos_for_lazy = -1) override;
 
  private:
   /**

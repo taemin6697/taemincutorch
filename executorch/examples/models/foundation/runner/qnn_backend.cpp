@@ -247,28 +247,32 @@ executorch::runtime::Error run_batch_qnn(
   const long rss_decoder_after = rss_kb();
   const long t_load_end = t_runner_load_end;
   const long rss_load_end = rss_decoder_after;
+  const int64_t kv_committed_after_load =
+      static_cast<int64_t>(runner.get_kv_cache_resident_bytes() / 1024);
   if (config.frame_count > 0) {
     fproc << "L_VisionLoad," << (t_encoder_load_start - t_run_start) / 1000.0 << ","
           << (t_encoder_load_end - t_run_start) / 1000.0 << ","
           << rss_encoder_before << "," << rss_encoder_after << ","
           << (t_encoder_load_end - t_encoder_load_start) << ",,"
-          << (t_encoder_load_end - t_encoder_load_start) << ",,,,,,\n";
+          << (t_encoder_load_end - t_encoder_load_start) << ",,,,,,0,\n";
   }
   fproc << "L_EmbeddingLoad," << (t_embedding_load_start - t_run_start) / 1000.0 << ","
         << (t_embedding_load_end - t_run_start) / 1000.0 << ","
         << rss_embedding_before << "," << rss_embedding_after << ","
         << (t_embedding_load_end - t_embedding_load_start) << ",,"
-        << (t_embedding_load_end - t_embedding_load_start) << ",,,,,,\n";
+        << (t_embedding_load_end - t_embedding_load_start) << ",,,,,,0,\n";
   fproc << "L_DecoderLoad," << (t_decoder_load_start - t_run_start) / 1000.0 << ","
         << (t_runner_load_end - t_run_start) / 1000.0 << ","
         << rss_decoder_before << "," << rss_decoder_after << ","
         << (t_runner_load_end - t_decoder_load_start) << ",,"
-        << (t_runner_load_end - t_decoder_load_start) << ",,,,,,\n";
+        << (t_runner_load_end - t_decoder_load_start) << ",,,,,,"
+        << kv_committed_after_load << ",\n";
   fproc << "L," << (t_load_start - t_run_start) / 1000.0 << ","
         << (t_load_end - t_run_start) / 1000.0 << ","
         << rss_load_start << "," << rss_load_end << ","
         << (t_load_end - t_load_start) << ",,"
-        << (t_load_end - t_load_start) << ",,,,,,\n";
+        << (t_load_end - t_load_start) << ",,,,,,"
+        << kv_committed_after_load << ",\n";
   for (const auto& row : vision_rows) {
     fproc << row;
   }
@@ -420,7 +424,8 @@ executorch::runtime::Error run_batch_qnn(
             << (em_timing.end_ms - t_run_start) / 1000.0 << ","
             << em_timing.rss_kb_start << "," << em_timing.rss_kb_end << ","
             << (em_timing.end_ms - em_timing.start_ms) << ",,"
-            << (em_timing.end_ms - em_timing.start_ms) << ",,,,,,\n";
+            << (em_timing.end_ms - em_timing.start_ms) << ",,,,,,"
+            << kv_committed_after_load << ",\n";
     }
     fproc << "T_Prefill," << elapsed_prefill_start << ","
           << elapsed_prefill_end << ","
@@ -433,7 +438,8 @@ executorch::runtime::Error run_batch_qnn(
                                    : text_kv_prefill_ms)
           << ","
           << kv_prefill << "," << kv_ctx << "," << kv_pct_prefill << ","
-          << kv_estimated_used_kb_prefill << "," << kv_total_kb_q << ",,\n";
+          << kv_estimated_used_kb_prefill << "," << kv_total_kb_q << ","
+          << kv_committed_after_load << ",\n";
     fproc << "Decode," << elapsed_decode_start << "," << elapsed_decode_end << ","
           << (has_internal_decode ? decode_timing.rss_kb_start : rss_first) << ","
           << (has_internal_decode ? decode_timing.rss_kb_end : rss_q) << ","

@@ -8,6 +8,7 @@
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
 #include <executorch/extension/llm/runner/util.h>
+#include <executorch/runtime/platform/log.h>
 #include <numeric>
 
 using executorch::aten::TensorImpl;
@@ -69,6 +70,7 @@ template <typename T>
 void TokenGenerator<T>::init_io(
     IMemAlloc* buffer_manager,
     Result<MethodMeta> method_meta) {
+  buffer_manager_ = buffer_manager;
   size_t idx = 0;
   input_tensors_.reserve(method_meta->num_inputs());
   output_tensors_.reserve(method_meta->num_outputs());
@@ -230,7 +232,8 @@ Result<int64_t> TokenGenerator<T>::generate(
     std::function<void(const std::string&)> token_callback,
     bool dump_logits,
     AttentionSinkRopeRunner* attention_sink_rope_runner,
-    PerTokenTimingCallback per_token_timing_cb) {
+    PerTokenTimingCallback per_token_timing_cb,
+    int32_t max_pos_for_lazy) {
   ET_CHECK_MSG(
       !tokens.empty(), "Token generation loop shouldn't take empty tokens");
   int64_t pos = start_pos; // position in the sequence
@@ -240,8 +243,14 @@ Result<int64_t> TokenGenerator<T>::generate(
   // Token after prefill
   uint64_t cur_token = tokens.back();
   uint64_t prev_token;
-  // Rearrange KV cache first
-  kv_manager_->rearrange_cache(metadata_.ar_len);
+  // Rearrange KV cache first. When max_pos_for_lazy > 0 (lazy mode), only touch
+  // [0, max_pos_for_lazy) to preserve lazy mmap; decode will commit the rest.
+  kv_manager_->rearrange_cache(metadata_.ar_len, max_pos_for_lazy);
+  if (buffer_manager_ && kv_manager_) {
+    const size_t kb =
+        kv_manager_->resident_cache_size_in_bytes(*buffer_manager_) / 1024;
+    ET_LOG(Info, "[kv_commit_verify] after rearrange_cache: %zu KB", kb);
+  }
   std::vector<int32_t> attention_map(metadata_.ar_len);
   std::iota(attention_map.begin(), attention_map.end(), -1);
 
@@ -268,6 +277,11 @@ Result<int64_t> TokenGenerator<T>::generate(
         shifted_pos,
         metadata_.sliding_window);
   }
+  if (buffer_manager_ && kv_manager_) {
+    const size_t kb =
+        kv_manager_->resident_cache_size_in_bytes(*buffer_manager_) / 1024;
+    ET_LOG(Info, "[kv_commit_verify] after init_attention_mask: %zu KB", kb);
+  }
 
   // Initialize the output of the module
   ET_CHECK_MSG(
@@ -275,6 +289,11 @@ Result<int64_t> TokenGenerator<T>::generate(
           executorch::runtime::Error::Ok,
       "Failed to set output tensor for module %s",
       method_name_.c_str());
+  if (buffer_manager_ && kv_manager_) {
+    const size_t kb =
+        kv_manager_->resident_cache_size_in_bytes(*buffer_manager_) / 1024;
+    ET_LOG(Info, "[kv_commit_verify] after set_outputs: %zu KB", kb);
+  }
 
   // Generate our tokens
   while (pos < seq_len - 1) {
@@ -304,9 +323,26 @@ Result<int64_t> TokenGenerator<T>::generate(
     // Fill in the token and position data
     prepare_io(cur_token, shifted_pos);
 
+    const bool is_first_decode_step = (pos == start_pos);
+    size_t kv_committed_before_kb = 0;
+    if (is_first_decode_step && buffer_manager_ && kv_manager_) {
+      kv_committed_before_kb =
+          kv_manager_->resident_cache_size_in_bytes(*buffer_manager_) / 1024;
+    }
+
     long t_start_ms = time_in_ms();
     // Run inference
     auto logits_res = decoder_runner_->step(method_name_, inputs_);
+    if (is_first_decode_step && buffer_manager_ && kv_manager_) {
+      const size_t kv_committed_after_kb =
+          kv_manager_->resident_cache_size_in_bytes(*buffer_manager_) / 1024;
+      ET_LOG(
+          Info,
+          "[kv_commit_verify] before step: %zu KB, after step: %zu KB, delta: %zu KB",
+          kv_committed_before_kb,
+          kv_committed_after_kb,
+          kv_committed_after_kb - kv_committed_before_kb);
+    }
     if (dump_logits) {
       token_all_logits_.insert(
           token_all_logits_.end(),

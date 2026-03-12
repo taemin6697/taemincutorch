@@ -49,8 +49,10 @@ class KVManager {
   /**
    * @brief Switch key and value cache from AR-cur to AR-dst.
    * @param ar_len_dst Target length of input tokens.
+   * @param max_pos_for_lazy When > 0 (lazy mode), only touch positions [0, max_pos_for_lazy)
+   *        to preserve lazy mmap; decode will commit the rest gradually.
    */
-  void rearrange_cache(int32_t ar_len_dst);
+  void rearrange_cache(int32_t ar_len_dst, int32_t max_pos_for_lazy = -1);
 
   /**
    * @brief Initialize attention mask based on kv manager mode, and attention
@@ -183,8 +185,14 @@ class KVManager {
 
  private:
   // Helper functions to rearrange and update key and value caches
-  void rearrange_key(KVCache<T>& k_cache, int32_t ar_len_dst);
-  void rearrange_value(KVCache<T>& v_cache, int32_t ar_len_dst);
+  void rearrange_key(
+      KVCache<T>& k_cache,
+      int32_t ar_len_dst,
+      int32_t max_pos_for_lazy = -1);
+  void rearrange_value(
+      KVCache<T>& v_cache,
+      int32_t ar_len_dst,
+      int32_t max_pos_for_lazy = -1);
   void update_key(
       KVCache<T>& k_cache,
       int32_t n_past,

@@ -199,7 +199,8 @@ Result<int64_t> LhdTokenGenerator<T>::generate(
     std::function<void(const std::string&)> token_callback,
     bool dump_logits,
     AttentionSinkRopeRunner* attention_sink_rope_runner,
-    typename TokenGenerator<T>::PerTokenTimingCallback per_token_timing_cb) {
+    typename TokenGenerator<T>::PerTokenTimingCallback per_token_timing_cb,
+    int32_t max_pos_for_lazy) {
   ET_CHECK_MSG(
       !tokens.empty(), "Token generation loop shouldn't take empty tokens");
   // position in the sequence
@@ -220,8 +221,9 @@ Result<int64_t> LhdTokenGenerator<T>::generate(
   input_tokens.reserve(metadata_.ar_len);
   input_pos.reserve(metadata_.ar_len);
 
-  // Rearrange KV cache first and initialize the input and output of KV cache
-  this->kv_manager_->rearrange_cache(metadata_.ar_len);
+  // Rearrange KV cache first. When max_pos_for_lazy > 0 (lazy mode), only
+  // touch [0, max_pos_for_lazy) to preserve lazy mmap.
+  this->kv_manager_->rearrange_cache(metadata_.ar_len, max_pos_for_lazy);
 
   // Initialize attention sink rope runner if given and update position
   // accordingly
@@ -303,11 +305,31 @@ Result<int64_t> LhdTokenGenerator<T>::generate(
     // Fill in the token and position data
     prepare_io(input_tokens, input_pos);
 
+    const bool is_first_decode_step = (pos == start_pos);
+    size_t kv_committed_before_kb = 0;
+    if (is_first_decode_step && this->buffer_manager_ && this->kv_manager_) {
+      kv_committed_before_kb =
+          this->kv_manager_->resident_cache_size_in_bytes(*this->buffer_manager_) /
+          1024;
+    }
+
     long t_start_ms = executorch::extension::llm::time_in_ms();
     // Run inference
     auto logits_res =
         this->decoder_runner_->step(this->method_name_, this->inputs_);
     ET_CHECK_OK_OR_RETURN_ERROR(logits_res.error());
+
+    if (is_first_decode_step && this->buffer_manager_ && this->kv_manager_) {
+      const size_t kv_committed_after_kb =
+          this->kv_manager_->resident_cache_size_in_bytes(*this->buffer_manager_) /
+          1024;
+      ET_LOG(
+          Info,
+          "[kv_commit_verify] before step: %zu KB, after step: %zu KB, delta: %zu KB",
+          kv_committed_before_kb,
+          kv_committed_after_kb,
+          kv_committed_after_kb - kv_committed_before_kb);
+    }
     executorch::aten::Tensor& logits_tensor = logits_res.get();
     prev_pos = shifted_pos;
 

@@ -12,6 +12,8 @@ def _float_or_nan(value: str | None) -> float:
 
 def generate_memory_timeline_plot(out_dir: Path) -> Path | None:
     timeline_csv = out_dir / "android_memory_timeline.csv"
+    if not timeline_csv.exists():
+        timeline_csv = out_dir / "android_memory_timeline_runner.csv"
     proc_csv = out_dir / "foundation_proc.csv"
     output_png = out_dir / "memory_timeline_plot.png"
 
@@ -254,5 +256,41 @@ def generate_memory_timeline_plot(out_dir: Path) -> Path | None:
             fig2.tight_layout()
             fig2.savefig(decode_speed_png, bbox_inches="tight")
             plt.close(fig2)
+
+    # MemAvailable during decode (디코드 시작 ~ 끝, 남은 메모리)
+    decode_phase_rows = [(r[1], r[2]) for r in proc_rows if r[0] == "Decode"]
+    if decode_phase_rows:
+        decode_start = min(s for s, _ in decode_phase_rows)
+        decode_end = max(e for _, e in decode_phase_rows)
+        decode_timeline = [
+            r
+            for r in timeline_rows
+            if decode_start <= float(r["elapsed_s"]) <= decode_end
+            and not math.isnan(float(r.get("mem_available_mb", math.nan)))
+        ]
+        if decode_timeline:
+            fig3, ax3 = plt.subplots(figsize=(14, 6), dpi=120)
+            xs_decode = [float(r["elapsed_s"]) for r in decode_timeline]
+            mem_decode = [float(r["mem_available_mb"]) for r in decode_timeline]
+            ax3.plot(
+                xs_decode,
+                mem_decode,
+                color="#0984e3",
+                linewidth=2.0,
+                marker="o",
+                markersize=2.2,
+                label="MemAvailable (MB)",
+            )
+            ax3.axvspan(decode_start, decode_end, color="#d63031", alpha=0.08)
+            ax3.set_title("MemAvailable during Decode (remaining memory)")
+            ax3.set_xlabel("Elapsed Time (s)")
+            ax3.set_ylabel("MemAvailable (MB)")
+            ax3.grid(True, linestyle=":", alpha=0.35)
+            ax3.legend(loc="upper right", fontsize=9)
+            ax3.set_xlim(left=decode_start, right=decode_end)
+            fig3.tight_layout()
+            mem_available_decode_png = out_dir / "mem_available_during_decode.png"
+            fig3.savefig(mem_available_decode_png, bbox_inches="tight")
+            plt.close(fig3)
 
     return output_png

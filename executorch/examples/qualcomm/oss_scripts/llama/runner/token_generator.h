@@ -81,7 +81,8 @@ class TokenGenerator {
       std::function<void(const std::string&)> token_callback,
       bool dump_logits,
       AttentionSinkRopeRunner* attention_sink_rope_runner,
-      PerTokenTimingCallback per_token_timing_cb = nullptr);
+      PerTokenTimingCallback per_token_timing_cb = nullptr,
+      int32_t max_pos_for_lazy = -1);
   inline const size_t total_token_generator_io_size_in_bytes() const {
     if (metadata_.cache_mode == CacheMode::HybridCache) {
       return input_toks_.size + input_pos_.size + attention_mask_.size +
@@ -96,6 +97,7 @@ class TokenGenerator {
   tokenizers::Tokenizer* tokenizer_;
   DecoderRunner* decoder_runner_;
   KVManager<T>* kv_manager_;
+  IMemAlloc* buffer_manager_{nullptr};
   std::string method_name_;
   std::unique_ptr<std::unordered_set<uint64_t>> eos_ids_;
 

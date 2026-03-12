@@ -298,7 +298,8 @@ Error MultimodalRunner<T>::load() {
           use_int64_token,
           sliding_window,
           cache_mode_,
-          static_cast<int32_t>(dim)});
+          static_cast<int32_t>(dim)},
+      lazy_kv_alloc_);
 
   if (eval_mode_ == EvalMode::kLookaheadDecoding ||
       eval_mode_ == EvalMode::kHybrid) {
@@ -580,7 +581,15 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
     token_callback(prompt);
   }
   bool dump_logits = dump_logits_path_.empty() ? false : true;
+  ET_LOG(
+      Info,
+      "[kv_commit_verify] before embedding_prefill: %zu KB",
+      get_kv_cache_resident_bytes() / 1024);
   embedding_processor_->prefill(prompt_tokens);
+  ET_LOG(
+      Info,
+      "[kv_commit_verify] after embedding_prefill: %zu KB",
+      get_kv_cache_resident_bytes() / 1024);
   const TensorStruct<float>& text_embeddings =
       embedding_processor_->get_prompt_embeddings();
   int64_t embedding_dim = text_embeddings.tensor->size(2);
@@ -592,8 +601,16 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
   }
 
   ET_LOG(Info, "Merging text embeddings with image hidden states");
+  ET_LOG(
+      Info,
+      "[kv_commit_verify] before merge: %zu KB",
+      get_kv_cache_resident_bytes() / 1024);
   merge_multimodal_embeddings(
       prompt_tokens, text_embeddings, placeholder_token_id);
+  ET_LOG(
+      Info,
+      "[kv_commit_verify] after merge: %zu KB",
+      get_kv_cache_resident_bytes() / 1024);
   last_generate_phase_timings_.embedding_and_merging.end_ms = time_in_ms();
   last_generate_phase_timings_.embedding_and_merging.rss_kb_end =
       static_cast<long>(get_rss_bytes() / 1024);
@@ -601,6 +618,10 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
   last_generate_phase_timings_.prefill.start_ms = time_in_ms();
   last_generate_phase_timings_.prefill.rss_kb_start =
       static_cast<long>(get_rss_bytes() / 1024);
+  ET_LOG(
+      Info,
+      "[kv_commit_verify] before prefill: %zu KB",
+      get_kv_cache_resident_bytes() / 1024);
   auto prefill_res = prompt_processor_->prefill(
       merged_embeddings_, cur_pos_, dump_logits, nullptr);
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
@@ -622,6 +643,10 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
       Info,
       "RSS after prompt prefill: %f MiB (0 if unsupported)",
       get_rss_bytes() / 1024.0 / 1024.0);
+  ET_LOG(
+      Info,
+      "[kv_commit_verify] after prefill: %zu KB",
+      get_kv_cache_resident_bytes() / 1024);
 
   // start the main loop
   prompt_tokens.push_back(cur_token);
@@ -670,6 +695,10 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
       }
     }
   }
+  ET_LOG(
+      Info,
+      "[kv_commit_verify] after requant: %zu KB",
+      get_kv_cache_resident_bytes() / 1024);
 
   last_generate_phase_timings_.decode.start_ms = time_in_ms();
   last_generate_phase_timings_.decode.rss_kb_start =
@@ -682,7 +711,8 @@ Error MultimodalRunner<T>::generate_from_prompt_or_file(
       token_callback,
       dump_logits,
       nullptr,
-      config.per_token_timing_cb));
+      config.per_token_timing_cb,
+      lazy_kv_alloc_ ? static_cast<int32_t>(cur_pos_) : -1));
   last_generate_phase_timings_.decode.end_ms = time_in_ms();
   last_generate_phase_timings_.decode.rss_kb_end =
       static_cast<long>(get_rss_bytes() / 1024);

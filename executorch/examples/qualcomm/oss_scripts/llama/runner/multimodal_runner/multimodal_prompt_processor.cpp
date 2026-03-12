@@ -7,6 +7,7 @@
  */
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/multimodal_prompt_processor.h>
+#include <executorch/runtime/platform/log.h>
 #include <numeric>
 
 using executorch::aten::TensorImpl;
@@ -21,7 +22,8 @@ MultimodalPromptProcessor<T>::MultimodalPromptProcessor(
     DecoderRunner* decoder_runner,
     KVManager<T>* kv_manager,
     const std::string& method_name,
-    Metadata metadata)
+    Metadata metadata,
+    bool lazy_kv_alloc)
     : PromptProcessor<T>(
           decoder_runner,
           kv_manager,
@@ -34,7 +36,8 @@ MultimodalPromptProcessor<T>::MultimodalPromptProcessor(
            metadata.use_int64_token,
            metadata.sliding_window,
            metadata.cache_mode}),
-      metadata_(metadata) {
+      metadata_(metadata),
+      lazy_kv_alloc_(lazy_kv_alloc) {
   // Set input_toks_.size to 0 since we use embeddings instead
   input_toks_.size = 0;
   input_embedding_.size =
@@ -45,6 +48,7 @@ template <typename T>
 void MultimodalPromptProcessor<T>::init_io(
     IMemAlloc* buffer_manager,
     Result<MethodMeta> method_meta) {
+  buffer_manager_ = buffer_manager;
   size_t idx = 0;
   input_tensors_.reserve(method_meta->num_inputs());
   output_tensors_.reserve(method_meta->num_outputs());
@@ -238,8 +242,12 @@ Result<uint64_t> MultimodalPromptProcessor<T>::prefill(
       metadata_.ar_len,
       num_iters);
 
-  // Rearrange KV cache first
-  kv_manager_->rearrange_cache(metadata_.ar_len);
+  // Rearrange KV cache first. When lazy_kv_alloc, only touch [0, start_pos +
+  // num_prompt_tokens) to preserve lazy mmap; decode will commit the rest.
+  const int32_t max_pos_for_lazy = lazy_kv_alloc_
+      ? static_cast<int32_t>(start_pos + num_prompt_tokens)
+      : -1;
+  kv_manager_->rearrange_cache(metadata_.ar_len, max_pos_for_lazy);
   std::vector<int32_t> attention_map(metadata_.ar_len);
   std::iota(attention_map.begin(), attention_map.end(), -1);
   // Initialize attention mask with current position
@@ -275,7 +283,23 @@ Result<uint64_t> MultimodalPromptProcessor<T>::prefill(
       T* v_cache_data = v_cache_ptrs[layer].buffer;
     }
 
+    size_t kv_before_kb = 0;
+    if (buffer_manager_ && kv_manager_) {
+      kv_before_kb =
+          kv_manager_->resident_cache_size_in_bytes(*buffer_manager_) / 1024;
+    }
     decoder_runner_->step(method_name_, inputs_);
+    if (buffer_manager_ && kv_manager_) {
+      const size_t kv_after_kb =
+          kv_manager_->resident_cache_size_in_bytes(*buffer_manager_) / 1024;
+      ET_LOG(
+          Info,
+          "[kv_commit_verify] prefill step iter=%d: before %zu KB, after %zu KB, delta %zu KB",
+          static_cast<int>(i),
+          kv_before_kb,
+          kv_after_kb,
+          kv_after_kb - kv_before_kb);
+    }
     if (dump_logits) {
       prompt_all_logits_.insert(
           prompt_all_logits_.end(),
