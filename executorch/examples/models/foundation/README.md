@@ -1,3 +1,255 @@
+# Foundation VLM 실행 가이드
+
+`executorch/examples/models/foundation`은 InternVL3 기반 VLM을 XNNPACK 또는 QNN
+split-PTE 형태로 export하고 Android 디바이스에서 실행하기 위한 최소 실행 경로입니다.
+
+기본 작업 디렉터리는 `/workspace/stream`입니다.
+
+## 1. Export
+
+### XNNPACK
+
+```bash
+cd /workspace/stream
+
+python -m executorch.examples.models.foundation.cli export \
+  --backend xnnpack \
+  --artifact_root /workspace/stream/my_save/save_model/cpu/internvl3_xnnpack_1b_2k_kv \
+  --decoder_model internvl3_1b \
+  --model_path /workspace/stream/my_save/save_model/meta/InternVL3-1B-hf \
+  --checkpoint /workspace/stream/my_save/save_model/meta/internvl3_1b_meta_cpu.pth \
+  --max_seq_len 2048 \
+  --max_context_len 2048 \
+  --dtype fp16 \
+  --vision_quant fp16 \
+  --decoder_quant fp16 \
+  --embedding_quant fp16
+```
+
+### QNN
+
+QNN은 `--build_path`, `--device`, `--model`이 필요합니다.
+
+```bash
+cd /workspace/stream
+
+python -m executorch.examples.models.foundation.cli export \
+  --backend qnn \
+  --artifact_root /workspace/stream/my_save/save_model/qnn/internvl3_hybrid_16p_2k \
+  --decoder_model internvl3_1b \
+  -b build-android \
+  -s R3KYC01FW1P \
+  -m SM8750 \
+  --model_mode hybrid \
+  --prefill_ar_len 16 \
+  --max_seq_len 2048 \
+  --max_context_len 2048 \
+  --dtype fp32 \
+  --vision_quant fp16 \
+  --decoder_quant fp16 \
+  --embedding_quant fp16 \
+  --prompts "Can you describe this image?" \
+  --image_path "http://images.cocodataset.org/val2017/000000039769.jpg"
+```
+
+여러 모델과 context length를 한 번에 export하려면:
+
+```bash
+cd /workspace/stream
+bash executorch/examples/models/foundation/export_internvl3_all_lengths.sh all
+```
+
+## 2. Runner 빌드
+
+### XNNPACK Android 빌드
+
+```bash
+cd /workspace/stream/executorch
+
+export ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT:-/opt/android-ndk-r26c}
+
+cmake -S . -B build-android-xnnpack \
+  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-30 \
+  -DCMAKE_INSTALL_PREFIX="${PWD}/build-android-xnnpack" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON \
+  -DEXECUTORCH_BUILD_EXTENSION_FLAT_TENSOR=ON \
+  -DEXECUTORCH_BUILD_EXTENSION_MODULE=ON \
+  -DEXECUTORCH_BUILD_EXTENSION_TENSOR=ON \
+  -DEXECUTORCH_BUILD_EXTENSION_NAMED_DATA_MAP=ON \
+  -DEXECUTORCH_BUILD_EXTENSION_LLM=ON \
+  -DEXECUTORCH_BUILD_EXTENSION_LLM_RUNNER=ON \
+  -DEXECUTORCH_ENABLE_LOGGING=1 \
+  -DEXECUTORCH_BUILD_XNNPACK=ON \
+  -DEXECUTORCH_BUILD_KERNELS_OPTIMIZED=ON \
+  -DEXECUTORCH_BUILD_KERNELS_QUANTIZED=ON \
+  -DEXECUTORCH_BUILD_KERNELS_LLM=ON \
+  -DSUPPORT_REGEX_LOOKAHEAD=ON
+
+cmake --build build-android-xnnpack -j16 --target install --config Release
+```
+
+```bash
+cd /workspace/stream
+
+CMAKE_PREFIX="${PWD}/executorch/build-android-xnnpack;${PWD}/executorch/build-android-xnnpack/third-party/gflags"
+cmake -S executorch/examples/models/foundation \
+  -B executorch/build-android-xnnpack/foundation \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-30 \
+  -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX" \
+  -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
+  -Dgflags_DIR="${PWD}/executorch/build-android-xnnpack/third-party/gflags"
+
+cmake --build executorch/build-android-xnnpack/foundation -j16
+```
+
+### QNN Android 빌드
+
+```bash
+cd /workspace/stream/executorch
+./backends/qualcomm/scripts/build.sh --skip_x86_64
+```
+
+```bash
+cd /workspace/stream
+
+CMAKE_PREFIX="${PWD}/executorch/build-android;${PWD}/executorch/build-android/third-party/gflags;${PWD}/executorch/build-android/lib/cmake"
+cmake -S executorch/examples/models/foundation \
+  -B executorch/build-android/foundation \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-30 \
+  -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX" \
+  -DCMAKE_FIND_ROOT_PATH="${PWD}/executorch/build-android;${CMAKE_FIND_ROOT_PATH}" \
+  -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
+  -Dgflags_DIR="${PWD}/executorch/build-android/third-party/gflags" \
+  -Wno-dev
+
+cmake --build executorch/build-android/foundation -j16
+```
+
+## 3. 실행
+
+### XNNPACK 텍스트
+
+```bash
+cd /workspace/stream
+
+python -m executorch.examples.models.foundation.cli run \
+  --manifest /workspace/stream/my_save/save_model/cpu/internvl3_xnnpack_1b_2k_kv/manifest.json \
+  --runner_binary /workspace/stream/executorch/build-android-xnnpack/foundation/xnnpack_qnn_runner \
+  --device R3KYC01FW1P \
+  --questions "What is the capital of France? Answer in one sentence." \
+  --temperature 0.0 \
+  --save_log \
+  --ignore_eos \
+  --max_new_tokens 128
+```
+
+### XNNPACK 이미지
+
+```bash
+cd /workspace/stream
+
+python -m executorch.examples.models.foundation.cli run \
+  --manifest /workspace/stream/my_save/save_model/cpu/internvl3_xnnpack_1b_2k_kv/manifest.json \
+  --runner_binary /workspace/stream/executorch/build-android-xnnpack/foundation/xnnpack_qnn_runner \
+  --device R3KYC01FW1P \
+  --image http://images.cocodataset.org/val2017/000000039769.jpg \
+  --questions "Describe this image briefly using around 10 words." \
+  --temperature 0.0 \
+  --save_log
+```
+
+### QNN 텍스트
+
+```bash
+export QNN_SDK_ROOT=/path/to/qnn_sdk
+
+cd /workspace/stream
+
+python -m executorch.examples.models.foundation.cli run \
+  --manifest /workspace/stream/my_save/save_model/qnn/internvl3_hybrid_16p_2k/manifest.json \
+  --runner_binary /workspace/stream/executorch/build-android/foundation/xnnpack_qnn_runner \
+  -b executorch/build-android \
+  -s R3KYC01FW1P \
+  -m SM8750 \
+  --questions "What is the capital of France? Answer in one sentence." \
+  --temperature 0.0 \
+  --save_log \
+  --ignore_eos \
+  --max_new_tokens 512
+```
+
+### QNN 이미지
+
+```bash
+export QNN_SDK_ROOT=/path/to/qnn_sdk
+
+cd /workspace/stream
+
+python -m executorch.examples.models.foundation.cli run \
+  --manifest /workspace/stream/my_save/save_model/qnn/internvl3_hybrid_16p_2k/manifest.json \
+  --runner_binary /workspace/stream/executorch/build-android/foundation/xnnpack_qnn_runner \
+  -b executorch/build-android \
+  -s R3KYC01FW1P \
+  -m SM8750 \
+  --image http://images.cocodataset.org/val2017/000000039769.jpg \
+  --questions "Describe this image briefly using around 10 words." \
+  --temperature 0.0 \
+  --save_log
+```
+
+### 비디오
+
+XNNPACK과 QNN 모두 `--image` 대신 `--video`를 사용합니다.
+
+```bash
+python -m executorch.examples.models.foundation.cli run \
+  --manifest <manifest.json> \
+  --runner_binary <xnnpack_qnn_runner> \
+  --device R3KYC01FW1P \
+  --video /workspace/stream/my_save/sample_video/sample.mp4 \
+  --questions "Describe this video briefly using around 10 words." \
+  --temperature 0.0 \
+  --decode_after_frames 3 \
+  --save_log \
+  --ignore_eos \
+  --seq_len 1600
+```
+
+## 자주 쓰는 옵션
+
+- `--questions`: 텍스트 질문입니다. 여러 개를 연속으로 줄 수 있습니다.
+- `--image`: 이미지 URL 또는 로컬 이미지 경로입니다.
+- `--video`: 비디오 경로입니다.
+- `--decode_after_frames N`: 비디오에서 앞의 N프레임만 처리한 뒤 질문합니다.
+- `--seq_len N`: 프롬프트와 생성 토큰을 포함한 전체 sequence 상한입니다.
+- `--max_new_tokens N`: 최대 생성 토큰 수입니다. 지정하면 `--seq_len`보다 우선합니다.
+- `--ignore_eos`: EOS가 나와도 지정된 한도까지 계속 생성합니다.
+- `--save_log`: `my_save/save_log/{cpu,qnn}/...` 아래에 출력과 메모리 로그를 저장합니다.
+- `--lazy_kv_alloc`: QNN에서 KV cache lazy allocation 경로를 사용합니다.
+
+## 결과 로그
+
+`--save_log`를 사용하면 실행 파라미터 기반 폴더가 생성되고 보통 아래 파일들이 저장됩니다.
+
+```text
+foundation_output.txt
+foundation_proc.csv
+android_memory_timeline.csv
+memory_timeline_plot.png
+android_proc_meminfo_before.txt
+android_dumpsys_meminfo.txt
+android_smaps_rollup.txt
+android_proc_meminfo_after.txt
+```
 # Unified VLM Foundation
 
 `executorch/examples/models/foundation/` 는 QNN / XNNPACK 멀티모달 실행 경로를
